@@ -1,103 +1,116 @@
-# Interview Coach
+# AI Interview Coach
 
-Interview Coach is a mock interview practice app that records or uploads answer videos, collects a transcript, and returns coaching on content, structure, confidence, delivery, pauses, filler words, improved wording, follow-up questions, and interview risks.
+A local mock-interview practice tool. You pick a role and topic, answer questions on camera, and get an AI review of what you said plus **measurements of how you said it** (pauses, pace, filler words).
 
-It does not use OpenAI APIs. Provider order:
+> Built as a placement-preparation project with React, TypeScript, Node.js and the Groq API.
 
-1. Ollama
-2. LM Studio
-3. Hugging Face Inference Providers
-4. Groq
+<!-- Add screenshots here, e.g. ![Practice desk](docs/screenshots/practice-desk.png) -->
 
-## Run locally in VS Code
+## Features
 
-Requirements:
+**Implemented and tested on a real recording**
+
+- **Practice desk**: landing page with your saved interview rooms. A saved room only opens when you click it.
+- **Interview rooms**: create a room with a role, company, focus topic (Behavioral, Java & DSA, Web development, HR, Product, Leadership, Technical communication) and optional resume context.
+- **Questions that don't repeat**: choose between AI-generated questions (based on role, topic and background) and a built-in question bank. If the AI is unavailable or repeats itself, the app falls back to the bank. Every asked question is tracked per interview.
+- **Webcam recording and playback**, or upload an existing video.
+- **Automatic transcription** of your answer (Groq Whisper, called from the backend so the API key never reaches the browser).
+- **Delivery measured from the audio**: number of pauses (silences of 0.8 s or longer), longest pause, speaking time and speaking pace in words per minute.
+- **Filler words counted in the transcript**: um / uh / er / hmm, "you know", "I mean", "sort of / kind of", "basically".
+- **AI feedback**: overall, content, structure, confidence and delivery scores, strengths, improvements, an improved answer and likely follow-up questions. The prompt tells the model to use only what you actually said and to leave `[placeholders]` instead of inventing projects or experience.
+- **Delivery score from measured data**: when audio was measured, the delivery score is calculated from pace, filler rate and pauses rather than guessed by the AI.
+- **History survives restarts**: rooms and answers are saved to a local JSON file.
+
+## Tech stack
+
+| Part | Technology |
+| --- | --- |
+| Frontend | React, TypeScript, Vite, Wouter, TanStack Query, Tailwind CSS |
+| Backend | Node.js, Express |
+| AI | Groq (speech-to-text and analysis). The backend can also use Ollama, LM Studio or Hugging Face |
+| Audio analysis | Web Audio API in the browser (silence detection on the recorded audio) |
+| Monorepo | pnpm workspace (`artifacts/interview-coach`, `artifacts/api-server`, `lib/*`) |
+
+## How the delivery numbers are produced
+
+| Metric | Source |
+| --- | --- |
+| Pauses, longest pause, speaking time | **Measured** from the recorded audio (loudness per 30 ms frame against an adaptive threshold) |
+| Words per minute | Transcript word count divided by the measured speaking span |
+| Filler words | **Counted in the transcript**, so they depend on what Whisper transcribes |
+
+If audio could not be measured (for example a typed transcript), the app shows `--` instead of a number.
+
+## Getting started (Windows / PowerShell)
+
+### Prerequisites
 
 - Node.js 20 or newer
-- pnpm
-- Ollama for the no-key local path
+- pnpm (`npm install -g pnpm`)
+- A [Groq](https://console.groq.com) API key
 
-Install dependencies from the project root:
+### 1. Install
 
-```bash
+```powershell
 pnpm install
 ```
 
-Pull a supported Ollama model:
+### 2. Configure the backend
 
-```bash
-ollama pull qwen3:8b
+Create `artifacts/api-server/.env` (this file is git-ignored, never commit it):
+
+```
+PORT=8080
+GROQ_API_KEY=your_key_here
+AI_PROVIDER=groq
+GROQ_MODEL=your_chosen_groq_model
 ```
 
-Start Ollama:
+Optional: `INTERVIEWS_FILE` to change where history is saved (default: `artifacts/api-server/data/interviews.json`).
 
-```bash
-ollama serve
-```
-
-In terminal 1, start the API:
-
-```bash
-PORT=8080 pnpm --filter @workspace/api-server run dev
-```
-
-In terminal 2, start the frontend:
-
-```bash
-PORT=5173 BASE_PATH=/ VITE_API_BASE_URL=http://localhost:8080 pnpm --filter @workspace/interview-coach run dev
-```
-
-Open:
-
-```text
-http://localhost:5173
-```
-
-On Windows PowerShell:
+### 3. Start the backend
 
 ```powershell
-$env:PORT="8080"; pnpm --filter @workspace/api-server run dev
+pnpm --filter @workspace/api-server run dev
 ```
 
-In a second terminal:
+### 4. Start the frontend (second terminal)
 
 ```powershell
-$env:PORT="5173"; $env:BASE_PATH="/"; $env:VITE_API_BASE_URL="http://localhost:8080"; pnpm --filter @workspace/interview-coach run dev
+$env:PORT = "5173"
+$env:BASE_PATH = "/"
+$env:VITE_API_BASE_URL = "http://localhost:8080"
+pnpm --filter @workspace/interview-coach run dev
 ```
 
-When the app and Ollama run on the same computer, the browser can access local Ollama without the secure-preview limitation.
+Open http://localhost:5173.
 
-## Optional hosted providers
+## Privacy
 
-Copy the API example file and add values only if you want hosted fallbacks:
+- Recordings are handled in your browser. The audio is sent to Groq only to be transcribed, and the transcript is sent to the configured AI provider for feedback.
+- Rooms, transcripts and AI feedback are stored in a local JSON file that is git-ignored.
+- The Groq API key lives only in the backend `.env`.
 
-```bash
-cp artifacts/api-server/.env.example artifacts/api-server/.env
+## Known limitations
+
+- Longest pause, speaking time and WPM are shown live on the recording page but are **not yet saved** in the answer history. Saved answers keep the pause and filler counts only.
+- Answers recorded without audio measurement are stored with a pause count of 0.
+- Whisper sometimes drops filler words, so filler counts can be lower than what was actually said.
+- Pause detection was tested on synthetic signals and on real recordings in a quiet room; a very noisy room may need the threshold tuned (`artifacts/interview-coach/src/lib/audio-metrics.ts`).
+- Runs locally only. There is no deployed version or user login.
+
+## Roadmap
+
+- [ ] Save all delivery metrics with each answer
+- [ ] Replace the JSON file with a database
+- [ ] Progress charts across sessions
+- [ ] Deployment
+
+## Project structure
+
 ```
-
-Available variables:
-
-- `AI_PROVIDER=ollama|lmstudio|huggingface|groq`
-- `OLLAMA_BASE_URL`
-- `OLLAMA_MODEL`
-- `LM_STUDIO_BASE_URL`
-- `HF_API_KEY`
-- `HF_MODEL`
-- `GROQ_API_KEY`
-- `GROQ_MODEL`
-
-Never commit `.env` files or provider keys.
-
-## Main code
-
-- `artifacts/interview-coach/src/App.tsx` — frontend application and recording flow
-- `artifacts/interview-coach/src/index.css` — visual theme
-- `artifacts/api-server/src/routes/interviews.ts` — provider detection and analysis proxy
-- `lib/api-spec/openapi.yaml` — API contract
-
-## Checks
-
-```bash
-pnpm --filter @workspace/interview-coach run typecheck
-pnpm --filter @workspace/api-server run typecheck
+artifacts/
+  interview-coach/   React + Vite frontend (src/App.tsx, src/lib/audio-metrics.ts)
+  api-server/        Express backend (src/routes/interviews.ts, src/lib/question-bank.ts)
+lib/                 Shared API schemas and client
 ```
