@@ -1,0 +1,299 @@
+openapi: 3.1.0
+info:
+  # Do not change the title, if the title changes, the import paths will be broken
+  title: Api
+  version: 0.1.0
+  description: API specification
+servers:
+  - url: /api
+    description: Base API path
+tags:
+  - name: health
+    description: Health operations
+  - name: interviews
+    description: Interview practice sessions and AI analysis
+  - name: providers
+    description: Local and hosted model provider status
+paths:
+  /healthz:
+    get:
+      operationId: healthCheck
+      tags: [health]
+      summary: Health check
+      description: Returns server health status
+      responses:
+        "200":
+          description: Healthy
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthStatus"
+  /interviews:
+    get:
+      operationId: listInterviews
+      tags: [interviews]
+      summary: List interview sessions
+      responses:
+        "200":
+          description: Interview sessions
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/InterviewSummary"
+    post:
+      operationId: createInterview
+      tags: [interviews]
+      summary: Create an interview session
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/InterviewInput"
+      responses:
+        "201":
+          description: Created interview session
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Interview"
+  /interviews/{id}:
+    get:
+      operationId: getInterview
+      tags: [interviews]
+      summary: Get an interview session
+      parameters:
+        - $ref: "#/components/parameters/InterviewId"
+      responses:
+        "200":
+          description: Interview session
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Interview"
+        "404":
+          description: Interview not found
+  /interviews/{id}/analyze:
+    post:
+      operationId: analyzeInterviewAnswer
+      tags: [interviews]
+      summary: Analyze an interview answer with the active model provider
+      parameters:
+        - $ref: "#/components/parameters/InterviewId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AnswerAnalysisInput"
+      responses:
+        "200":
+          description: Answer analysis
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AnswerAnalysis"
+        "400":
+          description: Invalid analysis input
+  /providers/status:
+    get:
+      operationId: getProviderStatus
+      tags: [providers]
+      summary: Get available AI providers and active model
+      responses:
+        "200":
+          description: Provider status
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProviderStatus"
+components:
+  parameters:
+    InterviewId:
+      name: id
+      in: path
+      required: true
+      schema:
+        type: string
+  schemas:
+    HealthStatus:
+      type: object
+      properties:
+        status:
+          type: string
+      required:
+        - status
+    InterviewInput:
+      type: object
+      required: [title, role]
+      properties:
+        title:
+          type: string
+          minLength: 1
+        role:
+          type: string
+          minLength: 1
+        company:
+          type: string
+        resumeContext:
+          type: string
+        topic:
+          type: string
+    InterviewSummary:
+      type: object
+      required: [id, title, role, status, answerCount, score, updatedAt]
+      properties:
+        id:
+          type: string
+        title:
+          type: string
+        role:
+          type: string
+        company:
+          type: ["string", "null"]
+        status:
+          type: string
+          enum: [active, completed]
+        answerCount:
+          type: integer
+        score:
+          type: ["number", "null"]
+        updatedAt:
+          type: string
+    Interview:
+      allOf:
+        - $ref: "#/components/schemas/InterviewSummary"
+        - type: object
+          required: [resumeContext, topic, answers]
+          properties:
+            resumeContext:
+              type: string
+            topic:
+              type: string
+            answers:
+              type: array
+              items:
+                $ref: "#/components/schemas/Answer"
+    Answer:
+      type: object
+      required: [id, question, transcript, durationSeconds, pauseCount, fillerWordCount, analysis]
+      properties:
+        id:
+          type: string
+        question:
+          type: string
+        transcript:
+          type: string
+        durationSeconds:
+          type: number
+        pauseCount:
+          type: integer
+        fillerWordCount:
+          type: integer
+        analysis:
+          type: ["object", "null"]
+          additionalProperties: true
+    AnswerAnalysisInput:
+      type: object
+      required: [question, transcript, durationSeconds, pauseCount, fillerWordCount]
+      properties:
+        question:
+          type: string
+          minLength: 1
+        transcript:
+          type: string
+          minLength: 1
+        durationSeconds:
+          type: number
+          minimum: 0
+        pauseCount:
+          type: integer
+          minimum: 0
+        fillerWordCount:
+          type: integer
+          minimum: 0
+        resumeContext:
+          type: string
+        topic:
+          type: string
+        clientAnalysis:
+          $ref: "#/components/schemas/AnswerAnalysis"
+    Score:
+      type: object
+      required: [overall, content, structure, confidence, delivery]
+      properties:
+        overall:
+          type: number
+        content:
+          type: number
+        structure:
+          type: number
+        confidence:
+          type: number
+        delivery:
+          type: number
+    AnswerAnalysis:
+      type: object
+      required: [provider, model, scores, summary, strengths, improvements, improvedAnswer, followUpQuestions, riskFlags, pauseCount, fillerWordCount]
+      properties:
+        provider:
+          type: string
+        model:
+          type: string
+        scores:
+          $ref: "#/components/schemas/Score"
+        summary:
+          type: string
+        strengths:
+          type: array
+          items:
+            type: string
+        improvements:
+          type: array
+          items:
+            type: string
+        improvedAnswer:
+          type: string
+        followUpQuestions:
+          type: array
+          items:
+            type: string
+        riskFlags:
+          type: array
+          items:
+            type: string
+        pauseCount:
+          type: integer
+        fillerWordCount:
+          type: integer
+    Provider:
+      type: object
+      required: [id, label, status, model]
+      properties:
+        id:
+          type: string
+          enum: [ollama, lmstudio, huggingface, groq]
+        label:
+          type: string
+        status:
+          type: string
+          enum: [available, configured, unavailable]
+        model:
+          type: string
+        detail:
+          type: string
+    ProviderStatus:
+      type: object
+      required: [activeProvider, activeModel, providers]
+      properties:
+        activeProvider:
+          type: string
+        activeModel:
+          type: string
+        providers:
+          type: array
+          items:
+            $ref: "#/components/schemas/Provider"
+

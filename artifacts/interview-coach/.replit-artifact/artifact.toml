@@ -1,0 +1,28 @@
+kind = "web"
+previewPath = "/"
+title = "Interview Coach"
+description = "A focused mock interview coach that records or uploads answers, analyzes delivery and content, and gives actionable feedback without requiring OpenAI."
+version = "1.0.0"
+id = "artifacts/interview-coach"
+router = "path"
+
+[[services]]
+name = "web"
+paths = [ "/" ]
+localPort = 25252
+
+[services.development]
+run = "pnpm --filter @workspace/interview-coach run dev"
+
+[services.production]
+build = [ "pnpm", "--filter", "@workspace/interview-coach", "run", "build" ]
+serve = "static"
+publicDir = "artifacts/interview-coach/dist/public"
+
+[[services.production.rewrites]]
+from = "/*"
+to = "/index.html"
+
+[services.env]
+PORT = "25252"
+BASE_PATH = "/"
