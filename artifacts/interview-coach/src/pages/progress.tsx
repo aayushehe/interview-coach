@@ -8,6 +8,7 @@ import { cn } from '@/lib/utils';
 import { LONG_ANSWER_SECONDS, SHORT_ANSWER_SECONDS, fetchProgress } from '@/lib/coach-api';
 import type { ProgressData } from '@/lib/coach-api';
 import { SessionReportView, formatDuration } from '@/components/session-report';
+import { PAUSE_MIN_SECONDS } from '@/lib/audio-metrics';
 
 const TEAL = '#1f7a99';
 const AMBER = '#d49a40';
@@ -45,6 +46,10 @@ export function ProgressView({ data }: { data: ProgressData }) {
   const wpmRows = rows.filter((row) => row.wpm != null);
   const fillerRows = rows.filter((row) => row.fillersPer100Words != null);
   const lengthRows = rows.filter((row) => row.durationSeconds > 0);
+  const pauseRows = rows.filter((row) => row.longestPauseSeconds != null);
+  const longestPauseEver = pauseRows.length ? Math.max(...pauseRows.map((row) => row.longestPauseSeconds as number)) : null;
+  const levelByInterview = new Map<string, string>();
+  for (const answer of answers) if (answer.level) levelByInterview.set(answer.interviewId, answer.level);
   const sortedSessions = [...sessions].sort((a, b) => b.endedAt.localeCompare(a.endedAt));
 
   if (!answers.length) {
@@ -52,11 +57,12 @@ export function ProgressView({ data }: { data: ProgressData }) {
   }
 
   return <div className="space-y-6" data-testid="progress-view">
-    <div className="grid grid-cols-2 gap-3 lg:grid-cols-5">
+    <div className="grid grid-cols-2 gap-3 lg:grid-cols-3 xl:grid-cols-6">
       <Summary label="Answers" value={String(answers.length)} note={`${new Set(answers.map((a) => a.interviewId)).size} interview${new Set(answers.map((a) => a.interviewId)).size === 1 ? '' : 's'}`} />
       <Summary label="Sessions" value={String(sessions.length)} note="5-question runs" />
       <Summary label="Average score" value={overallAvg != null ? String(overallAvg) : '—'} note={trend != null ? `${trend >= 0 ? '+' : ''}${trend} vs earlier answers` : 'out of 100'} />
       <Summary label="Average pace" value={wpmRows.length ? String(rounded(average(wpmRows.map((r) => r.wpm as number)))) : '—'} note="words per minute (measured)" />
+      <Summary label="Longest pause" value={longestPauseEver != null ? `${longestPauseEver.toFixed(1)}s` : '—'} note={`silence of ${PAUSE_MIN_SECONDS}s or more (measured)`} />
       <Summary label="Fillers" value={fillerRows.length ? String(Math.round((average(fillerRows.map((r) => r.fillersPer100Words as number)) ?? 0) * 10) / 10) : '—'} note="per 100 words (transcript)" />
     </div>
 
@@ -70,6 +76,9 @@ export function ProgressView({ data }: { data: ProgressData }) {
       <Card title="Filler words" note="Fillers per 100 words, counted in the transcript. Lower is better.">
         {fillerRows.length < 2 ? <Empty text="Answer at least two questions to see a trend." /> : <div className="h-[250px]"><ResponsiveContainer width="100%" height="100%"><BarChart data={fillerRows} margin={{ top: 8, right: 12, bottom: 0, left: -18 }}><CartesianGrid stroke={GRID} vertical={false} /><XAxis dataKey="n" tick={{ fontSize: 11 }} /><YAxis tick={{ fontSize: 11 }} /><Tooltip /><Bar dataKey="fillersPer100Words" name="Fillers per 100 words" fill={AMBER} radius={[4, 4, 0, 0]} /></BarChart></ResponsiveContainer></div>}
       </Card>
+      <Card title="Longest pause" note={`The longest silence inside each answer, in seconds. Only silences of ${PAUSE_MIN_SECONDS}s or more count, and only for answers where audio was measured. Lower is smoother.`}>
+        {pauseRows.length < 2 ? <Empty text="Record at least two answers with the camera to see your pauses." /> : <div className="h-[250px]"><ResponsiveContainer width="100%" height="100%"><BarChart data={pauseRows} margin={{ top: 8, right: 12, bottom: 0, left: -18 }}><CartesianGrid stroke={GRID} vertical={false} /><XAxis dataKey="n" tick={{ fontSize: 11 }} /><YAxis tick={{ fontSize: 11 }} domain={[0, 'auto']} /><Tooltip /><Bar dataKey="longestPauseSeconds" name="Longest pause (s)" fill={AMBER} radius={[4, 4, 0, 0]} /></BarChart></ResponsiveContainer></div>}
+      </Card>
       <Card title="Answer length" note={`Seconds per answer. Dashed lines mark ${SHORT_ANSWER_SECONDS}s (too short) and ${LONG_ANSWER_SECONDS}s (too long).`}>
         {lengthRows.length < 2 ? <Empty text="Record at least two answers to see how long you speak." /> : <div className="h-[250px]"><ResponsiveContainer width="100%" height="100%"><BarChart data={lengthRows} margin={{ top: 8, right: 12, bottom: 0, left: -18 }}><CartesianGrid stroke={GRID} vertical={false} /><XAxis dataKey="n" tick={{ fontSize: 11 }} /><YAxis tick={{ fontSize: 11 }} /><Tooltip /><ReferenceLine y={SHORT_ANSWER_SECONDS} stroke="#a5412f" strokeDasharray="4 4" /><ReferenceLine y={LONG_ANSWER_SECONDS} stroke="#a5412f" strokeDasharray="4 4" /><Bar dataKey="durationSeconds" name="Seconds" fill={TEAL} radius={[4, 4, 0, 0]} /></BarChart></ResponsiveContainer></div>}
       </Card>
@@ -82,7 +91,12 @@ export function ProgressView({ data }: { data: ProgressData }) {
         const open = openSession === session.id;
         return <div key={session.id} className="rounded-2xl border border-border bg-card shadow-sm">
           <button type="button" onClick={() => setOpenSession(open ? '' : session.id)} data-testid={`button-session-${session.id}`} className="flex w-full flex-wrap items-center justify-between gap-3 px-5 py-4 text-left">
-            <div><p className="text-sm font-bold">{session.interviewTitle || 'Interview'}</p><p className="mt-1 text-xs text-muted-foreground">{shortDate(session.endedAt)} · {session.stats.answered} of {session.stats.planned} questions · {formatDuration(session.stats.totalSeconds)} total</p></div>
+            <div><p className="text-sm font-bold">{session.interviewTitle || 'Interview'}</p><p className="mt-1 text-xs text-muted-foreground">{shortDate(session.endedAt)} · {session.stats.answered} of {session.stats.planned} questions · {formatDuration(session.stats.totalSeconds)} total</p>
+              <p className="mt-1 text-xs text-muted-foreground">{[
+                levelByInterview.get(session.interviewId ?? '') ? `Level: ${levelByInterview.get(session.interviewId ?? '')}` : null,
+                session.stats.avgWpm != null ? `${Math.round(session.stats.avgWpm)} wpm` : null,
+                session.stats.longestPauseSeconds != null ? `longest pause ${session.stats.longestPauseSeconds.toFixed(1)}s` : null,
+              ].filter(Boolean).join(' · ') || 'Pace and pauses: no measured audio in this session'}</p></div>
             <div className="flex items-center gap-4"><span className="mono text-xl font-medium">{session.stats.avgScores ? session.stats.avgScores.overall : '—'}<span className="ml-1 text-[10px] text-muted-foreground">avg</span></span><span className={cn('text-xs font-bold text-primary')}>{open ? 'Hide report' : 'View report'}</span></div>
           </button>
           {open && <div className="border-t border-border p-4 sm:p-5"><SessionReportView report={session} /></div>}
