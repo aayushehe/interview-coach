@@ -1,19 +1,19 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import type { ChangeEvent, FormEvent, ReactNode } from 'react';
-import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import { MutationCache, QueryCache, QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import {
   ArrowLeft, ArrowUpRight, BookOpen, ChevronRight, CircleHelp,
-  Clock3, FileText, Gauge, Info, Loader2, Mic, Play, Plus, Radio, RotateCcw,
-  RefreshCw, Settings2, ShieldCheck, Sparkles, Square, TimerReset, TriangleAlert, Waves,
+  Clock3, FileText, Gauge, Info, LayoutDashboard, Loader2, Mic, Play, Plus, Radio, RotateCcw,
+  History as HistoryIcon, RefreshCw, Trash2, TrendingUp, Upload, Volume2, ShieldCheck, Sparkles, Square, TimerReset, TriangleAlert, Waves,
 } from 'lucide-react';
 import {
-  getGetInterviewQueryKey, getGetProviderStatusQueryKey, getListInterviewsQueryKey,
-  setBaseUrl,
-  useAnalyzeInterviewAnswer, useCreateInterview, useGetInterview, useGetProviderStatus,
+  getGetInterviewQueryKey, getListInterviewsQueryKey,
+  setAuthTokenGetter, setBaseUrl,
+  useAnalyzeInterviewAnswer, useCreateInterview, useGetInterview,
   useListInterviews,
 } from '@workspace/api-client-react';
 import type {
-  AnswerAnalysis, Interview, InterviewInput, InterviewSummary, Provider,
+  AnswerAnalysis, Interview, InterviewInput, InterviewSummary,
 } from '@workspace/api-client-react';
 import { Link, Route, Router as WouterRouter, Switch, useLocation, useParams } from 'wouter';
 import { ErrorBoundary } from '@/components/error-boundary';
@@ -22,11 +22,30 @@ import { TooltipProvider } from '@/components/ui/tooltip';
 import NotFound from '@/pages/not-found';
 import { PAUSE_MIN_SECONDS, analyzeAudioDelivery, computeWpm, countFillers, countWords } from '@/lib/audio-metrics';
 import type { AudioMetrics } from '@/lib/audio-metrics';
+import { extractTextFromFile } from '@/lib/extract-text';
+import { speak, speechSupported, stopSpeaking } from '@/lib/speech';
+import { deleteInterview } from '@/lib/coach-api';
+import { UNAUTHORIZED_EVENT, authFetch, checkSession, clearSession, getStoredUser, getToken } from '@/lib/auth-client';
+import { SessionRunner } from '@/components/session-runner';
+import ProgressPage from '@/pages/progress';
+import LoginPage from '@/pages/login';
+import DashboardPage from '@/pages/dashboard';
 
-const queryClient = new QueryClient();
+// Any 401 from the server (expired or invalid token) signs the user out.
+const handleUnauthorized = (error: unknown) => {
+  if ((error as { status?: number } | null)?.status === 401 && getToken()) {
+    clearSession();
+    window.dispatchEvent(new Event(UNAUTHORIZED_EVENT));
+  }
+};
+const queryClient = new QueryClient({
+  queryCache: new QueryCache({ onError: handleUnauthorized }),
+  mutationCache: new MutationCache({ onError: handleUnauthorized }),
+});
 if (import.meta.env.VITE_API_BASE_URL) {
   setBaseUrl(import.meta.env.VITE_API_BASE_URL);
 }
+setAuthTokenGetter(() => getToken());
 
 const cn = (...classes: Array<string | false | undefined>) => classes.filter(Boolean).join(' ');
 const formatDate = (value?: string) => value ? new Intl.DateTimeFormat('en', { month: 'short', day: 'numeric' }).format(new Date(value)) : '—';
@@ -34,13 +53,7 @@ const formatTime = (seconds: number) => `${Math.floor(seconds / 60).toString().p
 const scoreTone = (score?: number | null) => score == null ? 'text-muted-foreground' : score >= 80 ? 'text-[#267467]' : score >= 65 ? 'text-[#ae7219]' : 'text-[#b54c42]';
 const asAnalysis = (value: unknown): AnswerAnalysis | null => value && typeof value === 'object' ? value as AnswerAnalysis : null;
 const browserPreferredModels = ['qwen3:8b', 'llama3.1:8b', 'mistral:7b'];
-const readableProviderError = (error: unknown) => {
-  const message = error instanceof Error ? error.message : '';
-  if (/failed to fetch|networkerror|load failed/i.test(message)) {
-    return 'This secure preview cannot connect directly to HTTP Ollama on your computer. Run the app locally with Ollama, or configure a reachable HTTPS provider.';
-  }
-  return message || 'No AI provider is available. Start Ollama and try again.';
-};
+const FRIENDLY_AI_ERROR = 'The AI reviewer is not reachable right now. Please try again in a moment.';
 
 async function analyzeWithBrowserOllama(input: {
   question: string;
@@ -89,8 +102,9 @@ Topic: ${input.topic || 'General interview'}`;
   return { ...parsed, provider: 'Ollama (browser)', model, pauseCount: input.pauseCount, fillerWordCount: input.fillerWordCount };
 }
 
-function Shell({ children }: { children: ReactNode }) {
+function Shell({ children, user, onLogout }: { children: ReactNode; user: { name: string; email: string }; onLogout: () => void }) {
   const [location] = useLocation();
+  const initials = user.name.split(' ').map((w) => w[0]).join('').toUpperCase().slice(0, 2) || '?';
   return (
     <div className="noise min-h-[100dvh] bg-background text-foreground">
       <aside className="fixed inset-y-0 left-0 z-30 hidden w-[238px] flex-col bg-sidebar px-5 py-6 text-sidebar-foreground md:flex">
@@ -101,20 +115,35 @@ function Shell({ children }: { children: ReactNode }) {
         <p className="mono mb-3 px-3 text-[10px] uppercase tracking-[0.2em] text-sidebar-foreground/45">Your room</p>
         <nav className="space-y-1">
           <Link href="/" data-testid="link-dashboard" className={cn('flex items-center gap-3 rounded-xl px-3 py-3 text-sm font-semibold transition-colors', location === '/' ? 'bg-sidebar-accent text-sidebar-accent-foreground' : 'text-sidebar-foreground/65 hover:bg-white/5 hover:text-sidebar-foreground')}>
-            <Gauge size={17} /> Practice desk
+            <LayoutDashboard size={17} /> Dashboard
           </Link>
-          <Link href="/settings" data-testid="link-settings" className={cn('flex items-center gap-3 rounded-xl px-3 py-3 text-sm font-semibold transition-colors', location === '/settings' ? 'bg-sidebar-accent text-sidebar-accent-foreground' : 'text-sidebar-foreground/65 hover:bg-white/5 hover:text-sidebar-foreground')}>
-            <Settings2 size={17} /> Providers & settings
+          <Link href="/history" data-testid="link-history" className={cn('flex items-center gap-3 rounded-xl px-3 py-3 text-sm font-semibold transition-colors', (location === '/history' || location.startsWith('/interviews')) ? 'bg-sidebar-accent text-sidebar-accent-foreground' : 'text-sidebar-foreground/65 hover:bg-white/5 hover:text-sidebar-foreground')}>
+            <HistoryIcon size={17} /> Past interviews
+          </Link>
+          <Link href="/progress" data-testid="link-progress" className={cn('flex items-center gap-3 rounded-xl px-3 py-3 text-sm font-semibold transition-colors', location === '/progress' ? 'bg-sidebar-accent text-sidebar-accent-foreground' : 'text-sidebar-foreground/65 hover:bg-white/5 hover:text-sidebar-foreground')}>
+            <TrendingUp size={17} /> Progress
           </Link>
         </nav>
-        <div className="mt-auto rounded-2xl border border-white/10 bg-white/[0.045] p-4">
+        <div className="mt-auto space-y-4">
+          <div className="rounded-2xl border border-white/10 bg-white/[0.045] p-4">
           <div className="mb-3 flex items-center gap-2 text-sidebar-primary"><ShieldCheck size={16} /><span className="mono text-[10px] uppercase tracking-[0.15em]">Private by default</span></div>
           <p className="text-xs leading-5 text-sidebar-foreground/55">Your practice stays yours. Choose a local model when you want no-key, offline analysis.</p>
+        </div>
+          <div className="flex items-center gap-3 rounded-xl px-3 py-3">
+            <span className="grid h-8 w-8 shrink-0 place-items-center rounded-full bg-sidebar-primary text-[11px] font-bold text-sidebar-primary-foreground">{initials}</span>
+            <div className="min-w-0 flex-1">
+              <p className="truncate text-sm font-semibold text-sidebar-foreground/90">{user.name}</p>
+              <p className="truncate text-[10px] text-sidebar-foreground/40">{user.email}</p>
+            </div>
+            <button onClick={onLogout} title="Sign out" data-testid="button-logout" className="rounded-lg p-1.5 text-sidebar-foreground/40 transition-colors hover:bg-white/10 hover:text-sidebar-foreground/80">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" /><polyline points="16 17 21 12 16 7" /><line x1="21" y1="12" x2="9" y2="12" /></svg>
+            </button>
+          </div>
         </div>
       </aside>
       <header className="flex items-center justify-between border-b border-border bg-background/90 px-5 py-4 backdrop-blur md:hidden">
         <Link href="/" data-testid="link-mobile-brand" className="flex items-center gap-2 text-sm font-extrabold"><span className="grid h-8 w-8 place-items-center rounded-lg bg-sidebar text-sidebar-primary"><Waves size={16} /></span> Interview Coach</Link>
-        <Link href="/settings" data-testid="link-mobile-settings" className="rounded-lg p-2 text-muted-foreground"><Settings2 size={18} /></Link>
+        <span className="flex items-center"><Link href="/history" data-testid="link-mobile-history" className="rounded-lg p-2 text-muted-foreground"><HistoryIcon size={18} /></Link><Link href="/progress" data-testid="link-mobile-progress" className="rounded-lg p-2 text-muted-foreground"><TrendingUp size={18} /></Link><button onClick={onLogout} title="Sign out" className="rounded-lg p-2 text-muted-foreground hover:text-foreground"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" /><polyline points="16 17 21 12 16 7" /><line x1="21" y1="12" x2="9" y2="12" /></svg></button></span>
       </header>
       <main className="min-h-[100dvh] md:pl-[238px]">{children}</main>
     </div>
@@ -144,7 +173,19 @@ function SkeletonRows() {
 function NewInterviewDialog({ open, onClose }: { open: boolean; onClose: () => void }) {
   const create = useCreateInterview();
   const [, setLocation] = useLocation();
-  const [form, setForm] = useState<InterviewInput>({ title: '', role: '', company: '', topic: 'Behavioral', resumeContext: '' });
+  const [form, setForm] = useState<InterviewInput & { level: string; jobDescription: string }>({ title: '', role: '', company: '', topic: 'Behavioral', resumeContext: '', level: 'Intern / Fresher', jobDescription: '' });
+  const [uploads, setUploads] = useState<{ resume: { busy: boolean; message: string; error: boolean }; jd: { busy: boolean; message: string; error: boolean } }>({ resume: { busy: false, message: '', error: false }, jd: { busy: false, message: '', error: false } });
+  const handleFile = async (kind: 'resume' | 'jd', file: File | undefined) => {
+    if (!file) return;
+    setUploads((previous) => ({ ...previous, [kind]: { busy: true, message: '', error: false } }));
+    try {
+      const { text, truncated } = await extractTextFromFile(file);
+      setForm((previous) => kind === 'resume' ? { ...previous, resumeContext: text } : { ...previous, jobDescription: text });
+      setUploads((previous) => ({ ...previous, [kind]: { busy: false, error: false, message: `Read ${file.name} (${text.length} characters${truncated ? ', shortened to the first 6000' : ''}). Please check the text below.` } }));
+    } catch (error) {
+      setUploads((previous) => ({ ...previous, [kind]: { busy: false, error: true, message: error instanceof Error ? error.message : 'Could not read this file.' } }));
+    }
+  };
   if (!open) return null;
   const submit = (event: FormEvent) => {
     event.preventDefault();
@@ -157,8 +198,10 @@ function NewInterviewDialog({ open, onClose }: { open: boolean; onClose: () => v
       <form onSubmit={submit} className="space-y-4">
         <Field label="Session name" value={form.title} placeholder="Product sense warm-up" onChange={(value) => setForm({ ...form, title: value })} testId="input-interview-title" />
         <div className="grid gap-4 sm:grid-cols-2"><Field label="Role" value={form.role} placeholder="Product designer" onChange={(value) => setForm({ ...form, role: value })} testId="input-interview-role" /><Field label="Company (optional)" value={form.company || ''} placeholder="Northstar" onChange={(value) => setForm({ ...form, company: value })} testId="input-interview-company" /></div>
-        <div><label className="mb-2 block text-xs font-bold text-foreground/70">Focus</label><select value={form.topic} onChange={(event) => setForm({ ...form, topic: event.target.value })} data-testid="select-interview-topic" className="w-full rounded-xl border border-input bg-background px-3.5 py-3 text-sm outline-none focus:border-primary focus:ring-2 focus:ring-primary/15"><option>Behavioral</option><option>Technical: Java &amp; DSA</option><option>Technical: Web development</option><option>HR &amp; introduction</option><option>Product thinking</option><option>Leadership</option><option>Technical communication</option></select></div>
-        <div><label className="mb-2 block text-xs font-bold text-foreground/70">Context (optional)</label><textarea value={form.resumeContext || ''} onChange={(event) => setForm({ ...form, resumeContext: event.target.value })} data-testid="textarea-resume-context" rows={3} placeholder="Paste a few lines from your resume or the job brief…" className="w-full resize-none rounded-xl border border-input bg-background px-3.5 py-3 text-sm outline-none placeholder:text-muted-foreground/70 focus:border-primary focus:ring-2 focus:ring-primary/15" /></div>
+        <div><label className="mb-2 block text-xs font-bold text-foreground/70">Focus</label><select value={form.topic} onChange={(event) => setForm({ ...form, topic: event.target.value })} data-testid="select-interview-topic" className="w-full rounded-xl border border-input bg-background px-3.5 py-3 text-sm outline-none focus:border-primary focus:ring-2 focus:ring-primary/15"><option>Behavioral</option><option>Technical: Java &amp; DSA</option><option>Core CS: Mixed (DBMS, OS, CN, OOP)</option><option>Core CS: DBMS</option><option>Core CS: Operating systems</option><option>Core CS: Computer networks</option><option>Core CS: OOP concepts</option><option>Technical: Web development</option><option>HR &amp; introduction</option><option>Product thinking</option><option>Leadership</option><option>Technical communication</option></select></div>
+        <div><label className="mb-2 block text-xs font-bold text-foreground/70">Level</label><select value={form.level} onChange={(event) => setForm({ ...form, level: event.target.value })} data-testid="select-interview-level" className="w-full rounded-xl border border-input bg-background px-3.5 py-3 text-sm outline-none focus:border-primary focus:ring-2 focus:ring-primary/15"><option>Intern / Fresher</option><option>Junior (1-3 years)</option><option>Mid-level (3-6 years)</option><option>Senior (6+ years)</option></select></div>
+        <div><div className="mb-2 flex items-center justify-between gap-2"><label className="block text-xs font-bold text-foreground/70">Resume (optional)</label><label className="inline-flex cursor-pointer items-center gap-1.5 rounded-lg border border-border px-3 py-1.5 text-xs font-bold text-primary hover:bg-secondary">{uploads.resume.busy ? <Loader2 size={13} className="animate-spin" /> : <Upload size={13} />} Upload PDF / DOCX<input type="file" accept=".pdf,.docx,.txt,.md" className="hidden" disabled={uploads.resume.busy} data-testid="input-upload-resume" onChange={(event) => { handleFile('resume', event.target.files?.[0]); event.target.value = ''; }} /></label></div><textarea value={form.resumeContext || ''} onChange={(event) => setForm({ ...form, resumeContext: event.target.value })} data-testid="textarea-resume-context" rows={4} maxLength={6000} placeholder="Upload your resume above, or paste its text here. Questions can then be based on it." className="w-full resize-none rounded-xl border border-input bg-background px-3.5 py-3 text-sm outline-none placeholder:text-muted-foreground/70 focus:border-primary focus:ring-2 focus:ring-primary/15" />{uploads.resume.message && <p className={`mt-1.5 text-xs ${uploads.resume.error ? 'text-destructive' : 'text-muted-foreground'}`} data-testid="text-upload-resume">{uploads.resume.message}</p>}</div>
+        <div><div className="mb-2 flex items-center justify-between gap-2"><label className="block text-xs font-bold text-foreground/70">Job description (optional)</label><label className="inline-flex cursor-pointer items-center gap-1.5 rounded-lg border border-border px-3 py-1.5 text-xs font-bold text-primary hover:bg-secondary">{uploads.jd.busy ? <Loader2 size={13} className="animate-spin" /> : <Upload size={13} />} Upload PDF / DOCX<input type="file" accept=".pdf,.docx,.txt,.md" className="hidden" disabled={uploads.jd.busy} data-testid="input-upload-jd" onChange={(event) => { handleFile('jd', event.target.files?.[0]); event.target.value = ''; }} /></label></div><textarea value={form.jobDescription} onChange={(event) => setForm({ ...form, jobDescription: event.target.value })} data-testid="textarea-job-description" rows={4} maxLength={6000} placeholder="Upload the job description above, or paste its text here. Questions and feedback can then match the role." className="w-full resize-none rounded-xl border border-input bg-background px-3.5 py-3 text-sm outline-none placeholder:text-muted-foreground/70 focus:border-primary focus:ring-2 focus:ring-primary/15" />{uploads.jd.message && <p className={`mt-1.5 text-xs ${uploads.jd.error ? 'text-destructive' : 'text-muted-foreground'}`} data-testid="text-upload-jd">{uploads.jd.message}</p>}</div>
         <button disabled={create.isPending} data-testid="button-create-interview" className="mt-2 flex w-full items-center justify-center gap-2 rounded-xl bg-primary py-3.5 text-sm font-bold text-primary-foreground transition-transform hover:-translate-y-0.5 disabled:cursor-wait disabled:opacity-60">{create.isPending ? <Loader2 size={16} className="animate-spin" /> : <Plus size={16} />} Create room</button>
         {create.isError && <p className="text-center text-xs text-destructive">Couldn’t create this room. Try again.</p>}
       </form>
@@ -189,6 +232,10 @@ function PracticeWorkspace({ interview }: { interview: Interview }) {
   const [audioMetrics, setAudioMetrics] = useState<AudioMetrics | null>(null);
   const [audioNote, setAudioNote] = useState('');
   const firstQuestionLoadedFor = useRef('');
+  const [speakAloud, setSpeakAloud] = useState(() => { try { return localStorage.getItem('ic-speak-aloud') !== 'off'; } catch { return true; } });
+  const speakAloudRef = useRef(speakAloud);
+  speakAloudRef.current = speakAloud;
+  useEffect(() => () => stopSpeaking(), []);
   const [transcript, setTranscript] = useState('');
   const [isRecording, setIsRecording] = useState(false);
   const [seconds, setSeconds] = useState(0);
@@ -218,7 +265,7 @@ function PracticeWorkspace({ interview }: { interview: Interview }) {
     setQuestionNote('');
     try {
       const apiBase = import.meta.env.VITE_API_BASE_URL || '';
-      const res = await fetch(`${apiBase}/api/interviews/${interview.id}/next-question`, {
+      const res = await authFetch(`${apiBase}/api/interviews/${interview.id}/next-question`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ mode, fresh }),
@@ -228,6 +275,7 @@ function PracticeWorkspace({ interview }: { interview: Interview }) {
       setQuestion(data.question);
       setQuestionSource(data.source);
       setQuestionNote(data.note || '');
+      if (fresh && speakAloudRef.current && speechSupported()) speak(data.question);
     } catch {
       setQuestionNote('Could not load a question. You can type your own question above.');
     } finally {
@@ -272,7 +320,7 @@ function PracticeWorkspace({ interview }: { interview: Interview }) {
     setIsTranscribing(true);
     try {
       const apiBase = import.meta.env.VITE_API_BASE_URL || '';
-      const res = await fetch(`${apiBase}/api/transcribe`, {
+      const res = await authFetch(`${apiBase}/api/transcribe`, {
         method: 'POST',
         headers: {
           'Content-Type': blob.type || 'audio/webm',
@@ -297,6 +345,7 @@ function PracticeWorkspace({ interview }: { interview: Interview }) {
   };
 
   const startRecording = async () => {
+    stopSpeaking();
     setRecordError('');
     setAudioMetrics(null);
     setAudioNote('');
@@ -365,6 +414,11 @@ function PracticeWorkspace({ interview }: { interview: Interview }) {
     measureAudio(file);
   };
 
+  const toggleSpeakAloud = (value: boolean) => {
+    setSpeakAloud(value);
+    try { localStorage.setItem('ic-speak-aloud', value ? 'on' : 'off'); } catch { /* ignore */ }
+    if (!value) stopSpeaking();
+  };
   const submitAnswer = async (event: FormEvent) => {
     event.preventDefault();
     if (!question.trim() || !transcript.trim()) return;
@@ -399,7 +453,8 @@ function PracticeWorkspace({ interview }: { interview: Interview }) {
         const browserAnalysis = await analyzeWithBrowserOllama(data);
         finish(await analyze.mutateAsync({ id: interview.id, data: { ...data, clientAnalysis: browserAnalysis } }));
       } catch (browserError) {
-        setAnalysisError(serverMessage || readableProviderError(browserError));
+        console.error('Answer analysis failed:', serverMessage, browserError);
+        setAnalysisError(FRIENDLY_AI_ERROR);
       } finally {
         setIsLocalAnalyzing(false);
       }
@@ -408,10 +463,10 @@ function PracticeWorkspace({ interview }: { interview: Interview }) {
   return <section className="grid gap-5 xl:grid-cols-[minmax(0,1.35fr)_minmax(310px,.65fr)]">
     <div className="overflow-hidden rounded-[24px] border border-border bg-card shadow-sm">
       <div className="border-b border-border bg-[#edf3ef] px-6 py-5 sm:px-8"><div className="flex items-center justify-between gap-4"><div><p className="mono text-[10px] uppercase tracking-[0.18em] text-primary">On deck · {interview.topic || 'Open practice'}</p><h2 className="serif mt-2 text-2xl leading-tight">One answer at a time.</h2></div><span className="grid h-11 w-11 shrink-0 place-items-center rounded-full bg-card text-primary shadow-sm"><Mic size={19} /></span></div></div>
-      <form onSubmit={submitAnswer} className="p-6 sm:p-8">
-        <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+      <form onSubmit={submitAnswer} className="p-6 sm:p-8">\n        <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
           <label className="block text-xs font-bold uppercase tracking-[0.1em] text-muted-foreground">The question</label>
-          <div className="flex items-center gap-2">
+          <div className="flex flex-wrap items-center gap-2">
+            {speechSupported() && <><button type="button" onClick={() => speak(question)} disabled={!question.trim()} data-testid="button-listen-question" className="inline-flex items-center gap-1.5 rounded-lg border border-border px-3 py-1.5 text-xs font-bold text-primary hover:bg-secondary disabled:opacity-50"><Volume2 size={13} /> Listen</button><label className="flex cursor-pointer items-center gap-1.5 text-xs font-semibold text-muted-foreground"><input type="checkbox" checked={speakAloud} onChange={(event) => toggleSpeakAloud(event.target.checked)} data-testid="checkbox-read-aloud" /> Read aloud</label></>}
             <select value={questionMode} onChange={(event) => { const mode = event.target.value as 'ai' | 'bank'; setQuestionMode(mode); loadQuestion(true, mode); }} disabled={isRecording} data-testid="select-question-mode" className="rounded-lg border border-input bg-background px-2 py-1.5 text-xs font-semibold outline-none"><option value="ai">AI-generated questions</option><option value="bank">Built-in question bank</option></select>
             <button type="button" onClick={() => loadQuestion(true)} disabled={questionLoading || isRecording} data-testid="button-new-question" className="inline-flex items-center gap-1.5 rounded-lg border border-border px-3 py-1.5 text-xs font-bold text-primary hover:bg-secondary disabled:opacity-50">{questionLoading ? <Loader2 size={13} className="animate-spin" /> : <RefreshCw size={13} />} New question</button>
           </div>
@@ -453,7 +508,7 @@ function PracticeWorkspace({ interview }: { interview: Interview }) {
            <button type="button" onClick={resetAnswer} data-testid="button-reset-answer" className="inline-flex items-center justify-center gap-2 rounded-xl px-4 py-3 text-sm font-bold text-muted-foreground hover:bg-secondary"><RotateCcw size={15} /> Reset</button>
            <button disabled={analyze.isPending || isLocalAnalyzing || isTranscribing || !transcript.trim() || !question.trim()} data-testid="button-analyze-answer" className="inline-flex items-center justify-center gap-2 rounded-xl bg-primary px-5 py-3 text-sm font-bold text-primary-foreground shadow-md transition-transform hover:-translate-y-0.5 disabled:cursor-not-allowed disabled:opacity-45">
              {analyze.isPending || isLocalAnalyzing ? (
-               <><Loader2 size={16} className="animate-spin" /> {isLocalAnalyzing ? 'Checking local Ollama' : 'Analyzing your answer...'}</>
+               <><Loader2 size={16} className="animate-spin" /> {isLocalAnalyzing ? 'Analyzing your answer...' : 'Analyzing your answer...'}</>
              ) : isTranscribing ? (
                <><Loader2 size={16} className="animate-spin" /> Transcribing audio...</>
              ) : (
@@ -461,10 +516,10 @@ function PracticeWorkspace({ interview }: { interview: Interview }) {
              )}
            </button>
          </div>
-         {(analysisError || analyze.isError) && <p className="mt-3 text-right text-xs text-destructive">{analysisError || 'Analysis could not run. Check your provider in settings and try again.'}</p>}
+         {(analysisError || analyze.isError) && <p className="mt-3 text-right text-xs text-destructive">{analysisError || FRIENDLY_AI_ERROR}</p>}
       </form>
     </div>
-    <div className="space-y-5"><div className="rounded-[24px] border border-border bg-card p-6 shadow-sm"><div className="mb-5 flex items-center gap-2"><CircleHelp size={17} className="text-primary" /><h3 className="text-sm font-extrabold">A useful rhythm</h3></div><div className="space-y-4">{[['01', 'Frame it', 'Lead with the situation, not the backstory.'], ['02', 'Show your work', 'Name the choice you made and why.'], ['03', 'Land the learning', 'Close with the result or what changed.']].map(([number, title, body]) => <div key={number} className="flex gap-3"><span className="mono pt-0.5 text-[10px] text-primary">{number}</span><div><p className="text-sm font-bold">{title}</p><p className="mt-1 text-xs leading-5 text-muted-foreground">{body}</p></div></div>)}</div></div><div className="rounded-[24px] border border-[#d9e8e0] bg-[#eef6f0] p-6"><div className="flex items-start gap-3"><ShieldCheck size={18} className="mt-0.5 shrink-0 text-[#267467]" /><div><h3 className="text-sm font-extrabold text-[#225b52]">Your private rehearsal room</h3><p className="mt-2 text-xs leading-5 text-[#47756c]">Coach scores content and delivery together. Start with local Ollama for a no-key path.</p><Link href="/settings" data-testid="link-workspace-settings" className="mt-4 inline-flex items-center gap-1 text-xs font-extrabold text-[#267467]">Check providers <ArrowUpRight size={13} /></Link></div></div></div></div>
+    <div className="space-y-5"><div className="rounded-[24px] border border-border bg-card p-6 shadow-sm"><div className="mb-5 flex items-center gap-2"><CircleHelp size={17} className="text-primary" /><h3 className="text-sm font-extrabold">A useful rhythm</h3></div><div className="space-y-4">{[['01', 'Frame it', 'Lead with the situation, not the backstory.'], ['02', 'Show your work', 'Name the choice you made and why.'], ['03', 'Land the learning', 'Close with the result or what changed.']].map(([number, title, body]) => <div key={number} className="flex gap-3"><span className="mono pt-0.5 text-[10px] text-primary">{number}</span><div><p className="text-sm font-bold">{title}</p><p className="mt-1 text-xs leading-5 text-muted-foreground">{body}</p></div></div>)}</div></div><div className="rounded-[24px] border border-[#d9e8e0] bg-[#eef6f0] p-6"><div className="flex items-start gap-3"><ShieldCheck size={18} className="mt-0.5 shrink-0 text-[#267467]" /><div><h3 className="text-sm font-extrabold text-[#225b52]">Your private rehearsal room</h3><p className="mt-2 text-xs leading-5 text-[#47756c]">Coach scores content and delivery together. Your recordings and reports stay on this machine.</p></div></div></div></div>
   </section>;
 }
 
@@ -472,17 +527,49 @@ function Signal({ label, value, icon }: { label: string; value: string; icon: Re
   return <div className="text-center"><div className="mb-1 flex items-center justify-center gap-1 text-muted-foreground">{icon}<span className="text-[10px] font-bold uppercase tracking-wide">{label}</span></div><p className="mono text-sm font-medium">{value}</p></div>;
 }
 
-function Dashboard() {
+function DeleteInterviewButton({ interviewId, onDeleted }: { interviewId: string; onDeleted?: () => void }) {
+  const [confirming, setConfirming] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  const remove = async () => {
+    setBusy(true);
+    setError('');
+    try {
+      await deleteInterview(interviewId);
+      queryClient.removeQueries({ queryKey: getGetInterviewQueryKey(interviewId) });
+      queryClient.invalidateQueries({ queryKey: getListInterviewsQueryKey() });
+      queryClient.invalidateQueries({ queryKey: ['coach-progress'] });
+      onDeleted?.();
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : 'Could not delete this interview.');
+      setBusy(false);
+      setConfirming(false);
+    }
+  };
+  if (!confirming) return <span className="inline-flex flex-wrap items-center gap-2"><button type="button" onClick={() => setConfirming(true)} data-testid={`button-delete-${interviewId}`} className="inline-flex items-center gap-1.5 rounded-lg border border-border px-3 py-2 text-xs font-bold text-[#a94e45] transition-colors hover:bg-[#fff2ef]"><Trash2 size={14} /> Delete</button>{error && <span className="text-xs text-[#a94e45]">{error}</span>}</span>;
+  return <span className="inline-flex flex-wrap items-center gap-2 text-xs"><span className="font-semibold text-[#a94e45]">Delete this interview and all its answers?</span><button type="button" onClick={remove} disabled={busy} data-testid={`button-confirm-delete-${interviewId}`} className="inline-flex items-center gap-1.5 rounded-lg bg-[#a94e45] px-3 py-2 font-bold text-white disabled:opacity-60">{busy ? <Loader2 size={13} className="animate-spin" /> : <Trash2 size={13} />} Yes, delete</button><button type="button" onClick={() => setConfirming(false)} disabled={busy} className="rounded-lg border border-border px-3 py-2 font-bold hover:bg-secondary">Cancel</button></span>;
+}
+
+function HistoryPage() {
   const { data: interviewsData, isLoading, isError, refetch } = useListInterviews({ query: { queryKey: getListInterviewsQueryKey() } });
   const interviews = Array.isArray(interviewsData) ? interviewsData : [];
   const [isDialogOpen, setDialogOpen] = useState(false);
-   return <div className="mx-auto max-w-[1440px] px-5 py-8 sm:px-8 sm:py-12 lg:px-12">
-    <PageHeader eyebrow="Practice desk" title="Make the next answer clearer."><button onClick={() => setDialogOpen(true)} data-testid="button-new-interview" className="inline-flex items-center justify-center gap-2 rounded-xl bg-primary px-4 py-3 text-sm font-bold text-primary-foreground shadow-md transition-transform hover:-translate-y-0.5"><Plus size={16} /> New interview</button></PageHeader>
-    {isError ? <div className="rounded-2xl border border-[#edc8c3] bg-[#fff2ef] p-6"><div className="flex items-center gap-2 font-bold text-[#a94e45]"><TriangleAlert size={17} /> We could not load your practice rooms.</div><button onClick={() => refetch()} data-testid="button-retry-interviews" className="mt-4 inline-flex items-center gap-2 rounded-lg bg-[#a94e45] px-3 py-2 text-xs font-bold text-white">Try again <RotateCcw size={13} /></button></div> : isLoading ? <SkeletonRows /> : <div className="space-y-8"><EmptyState compact={interviews.length > 0} onCreate={() => setDialogOpen(true)} />{interviews.length > 0 && (
-      <section className="animate-rise-in" style={{ animationDelay: '100ms' }}><div className="mb-4 flex items-end justify-between"><div><p className="mono text-[10px] uppercase tracking-[0.18em] text-muted-foreground">Your rooms</p><h2 className="serif mt-2 text-2xl">Keep the thread.</h2></div><span className="text-xs text-muted-foreground">{interviews.length} total</span></div><div className="space-y-2">{interviews.map((interview) => <InterviewRow key={interview.id} interview={interview} />)}</div></section>)}
-    </div>}
+  return <div className="mx-auto max-w-[1100px] px-5 py-8 sm:px-8 sm:py-12 lg:px-12">
+    <PageHeader eyebrow="Past interviews" title="Everything you have practised."><button onClick={() => setDialogOpen(true)} data-testid="button-history-new" className="inline-flex items-center justify-center gap-2 rounded-xl bg-primary px-4 py-3 text-sm font-bold text-primary-foreground shadow-md transition-transform hover:-translate-y-0.5"><Plus size={16} /> New interview</button></PageHeader>
+    {isError ? <div className="rounded-2xl border border-[#edc8c3] bg-[#fff2ef] p-6"><div className="flex items-center gap-2 font-bold text-[#a94e45]"><TriangleAlert size={17} /> We could not load your interviews.</div><button onClick={() => refetch()} data-testid="button-retry-history" className="mt-4 inline-flex items-center gap-2 rounded-lg bg-[#a94e45] px-3 py-2 text-xs font-bold text-white">Try again <RotateCcw size={13} /></button></div>
+      : isLoading ? <SkeletonRows />
+      : interviews.length === 0 ? <div className="rounded-[24px] border border-dashed border-border bg-card/60 px-6 py-14 text-center"><h2 className="serif text-2xl">No past interviews yet.</h2><p className="mx-auto mt-3 max-w-md text-sm leading-6 text-muted-foreground">Rooms you create will be listed here, and you can delete the ones you no longer need.</p></div>
+      : <div className="space-y-3">{interviews.map((interview) => <div key={interview.id} className="space-y-2"><InterviewRow interview={interview} /><div className="flex justify-end px-1"><DeleteInterviewButton interviewId={interview.id} /></div></div>)}</div>}
     <NewInterviewDialog open={isDialogOpen} onClose={() => setDialogOpen(false)} />
   </div>;
+}
+
+function Home({ name }: { name: string }) {
+  const [isDialogOpen, setDialogOpen] = useState(false);
+  return <>
+    <DashboardPage name={name} onNew={() => setDialogOpen(true)} />
+    <NewInterviewDialog open={isDialogOpen} onClose={() => setDialogOpen(false)} />
+  </>;
 }
 
 function ScoreGrid({ scores }: { scores: AnswerAnalysis['scores'] }) {
@@ -491,7 +578,7 @@ function ScoreGrid({ scores }: { scores: AnswerAnalysis['scores'] }) {
 }
 
 function AnalysisPanel({ analysis }: { analysis: AnswerAnalysis }) {
-  return <div className="space-y-5 animate-rise-in"><ScoreGrid scores={analysis.scores} /><div className="grid gap-5 lg:grid-cols-2"><div className="rounded-[22px] border border-border bg-card p-6 shadow-sm"><div className="mb-3 flex items-center gap-2"><Sparkles size={17} className="text-primary" /><h3 className="text-sm font-extrabold">Coach’s read</h3></div><p className="text-sm leading-7 text-muted-foreground">{analysis.summary}</p><div className="mt-5 flex flex-wrap gap-2 text-[10px] text-muted-foreground"><span className="rounded-full bg-secondary px-2.5 py-1">Provider · {analysis.provider}</span><span className="rounded-full bg-secondary px-2.5 py-1">Model · {analysis.model}</span></div></div><div className="rounded-[22px] border border-border bg-card p-6 shadow-sm"><h3 className="mb-4 text-sm font-extrabold">Delivery signals</h3><div className="grid grid-cols-2 gap-3"><Metric label="Pauses" value={`${analysis.pauseCount ?? 0}`} note="intentional beats help" /><Metric label="Filler words" value={`${analysis.fillerWordCount ?? 0}`} note="watch the default phrases" /></div></div></div><div className="grid gap-5 lg:grid-cols-2"><ListBlock title="What landed" items={analysis.strengths} tone="good" /><ListBlock title="Try next time" items={analysis.improvements} tone="warn" /></div><div className="rounded-[22px] border border-[#d9e8e0] bg-[#eef6f0] p-6"><p className="mono text-[10px] uppercase tracking-[0.16em] text-[#267467]">A sharper version</p><p className="mt-3 text-sm leading-7 text-[#315e57]">{analysis.improvedAnswer}</p></div>{analysis.followUpQuestions?.length > 0 && <div className="rounded-[22px] border border-border bg-card p-6 shadow-sm"><h3 className="mb-4 text-sm font-extrabold">Possible follow-ups</h3><div className="space-y-3">{analysis.followUpQuestions.map((question, index) => <div key={question} className="flex gap-3 text-sm"><span className="mono text-[10px] text-primary">0{index + 1}</span><p>{question}</p></div>)}</div></div>}{analysis.riskFlags?.length > 0 && <div className="rounded-[22px] border border-[#edc8c3] bg-[#fff2ef] p-5 text-sm text-[#954a42]"><div className="mb-3 flex items-center gap-2 font-extrabold"><TriangleAlert size={16} /> Watch-outs</div><ul className="list-disc space-y-1 pl-5">{analysis.riskFlags.map((flag) => <li key={flag}>{flag}</li>)}</ul></div>}</div>;
+  return <div className="space-y-5 animate-rise-in"><ScoreGrid scores={analysis.scores} /><div className="grid gap-5 lg:grid-cols-2"><div className="rounded-[22px] border border-border bg-card p-6 shadow-sm"><div className="mb-3 flex items-center gap-2"><Sparkles size={17} className="text-primary" /><h3 className="text-sm font-extrabold">Coach’s read</h3></div><p className="text-sm leading-7 text-muted-foreground">{analysis.summary}</p><div className="mt-5 flex flex-wrap gap-2 text-[10px] text-muted-foreground"></div></div><div className="rounded-[22px] border border-border bg-card p-6 shadow-sm"><h3 className="mb-4 text-sm font-extrabold">Delivery signals</h3><div className="grid grid-cols-2 gap-3"><Metric label="Pauses" value={`${analysis.pauseCount ?? 0}`} note="intentional beats help" /><Metric label="Filler words" value={`${analysis.fillerWordCount ?? 0}`} note="watch the default phrases" /></div></div></div><div className="grid gap-5 lg:grid-cols-2"><ListBlock title="What landed" items={analysis.strengths} tone="good" /><ListBlock title="Try next time" items={analysis.improvements} tone="warn" /></div><div className="rounded-[22px] border border-[#d9e8e0] bg-[#eef6f0] p-6"><p className="mono text-[10px] uppercase tracking-[0.16em] text-[#267467]">A sharper version</p><p className="mt-3 text-sm leading-7 text-[#315e57]">{analysis.improvedAnswer}</p></div>{analysis.followUpQuestions?.length > 0 && <div className="rounded-[22px] border border-border bg-card p-6 shadow-sm"><h3 className="mb-4 text-sm font-extrabold">Possible follow-ups</h3><div className="space-y-3">{analysis.followUpQuestions.map((question, index) => <div key={question} className="flex gap-3 text-sm"><span className="mono text-[10px] text-primary">0{index + 1}</span><p>{question}</p></div>)}</div></div>}{analysis.riskFlags?.length > 0 && <div className="rounded-[22px] border border-[#edc8c3] bg-[#fff2ef] p-5 text-sm text-[#954a42]"><div className="mb-3 flex items-center gap-2 font-extrabold"><TriangleAlert size={16} /> Watch-outs</div><ul className="list-disc space-y-1 pl-5">{analysis.riskFlags.map((flag) => <li key={flag}>{flag}</li>)}</ul></div>}</div>;
 }
 
 function Metric({ label, value, note }: { label: string; value: string; note: string }) {
@@ -505,27 +592,17 @@ function ListBlock({ title, items, tone }: { title: string; items: string[]; ton
 function InterviewDetail() {
   const params = useParams<{ id: string }>();
   const id = params.id || '';
+  const [, setLocation] = useLocation();
   const { data: interview, isLoading, isError, refetch } = useGetInterview(id, { query: { enabled: !!id, queryKey: getGetInterviewQueryKey(id) } });
   const [selectedId, setSelectedId] = useState('');
+  const [sessionActive, setSessionActive] = useState(false);
   const [localAnalysis, setLocalAnalysis] = useState<AnswerAnalysis | null>(null);
   useEffect(() => { const stored = sessionStorage.getItem(`interview-analysis-${id}`); if (stored) { try { setLocalAnalysis(JSON.parse(stored) as AnswerAnalysis); } catch { setLocalAnalysis(null); } } }, [id]);
   const selected = useMemo(() => interview?.answers?.find((answer) => answer.id === selectedId) || interview?.answers?.[Math.max((interview?.answers?.length || 1) - 1, 0)], [interview, selectedId]);
   const analysis = asAnalysis(selected?.analysis) || localAnalysis;
   if (isLoading) return <div className="mx-auto max-w-5xl px-5 py-12"><SkeletonRows /></div>;
   if (isError || !interview) return <div className="mx-auto max-w-5xl px-5 py-12"><div className="rounded-2xl border border-[#edc8c3] bg-[#fff2ef] p-6 text-sm text-[#954a42]">This interview could not be opened. <button onClick={() => refetch()} data-testid="button-retry-detail" className="ml-2 font-bold underline">Try again</button></div></div>;
-  return <div className="mx-auto max-w-[1240px] px-5 py-8 sm:px-8 sm:py-12 lg:px-12"><Link href="/" data-testid="link-back-dashboard" className="mb-8 inline-flex items-center gap-2 text-xs font-bold text-muted-foreground hover:text-foreground"><ArrowLeft size={15} /> Back to practice desk</Link><PageHeader eyebrow={`${interview.role}${interview.company ? ` · ${interview.company}` : ''}`} title={interview.title}><span className="rounded-full bg-[#e2f0e8] px-3 py-1.5 text-xs font-bold text-[#267467]">{interview.answerCount || interview.answers.length} answers logged</span></PageHeader><div className="mb-8"><PracticeWorkspace interview={interview} /></div><div className="grid gap-5 xl:grid-cols-[290px_minmax(0,1fr)]"><aside className="h-fit rounded-[22px] border border-border bg-card p-4 shadow-sm"><div className="mb-4 flex items-center justify-between px-2"><p className="mono text-[10px] uppercase tracking-[0.16em] text-muted-foreground">Answer history</p><span className="text-xs text-muted-foreground">{interview.answers.length}</span></div>{interview.answers.length ? <div className="space-y-1">{interview.answers.map((answer, index) => { const answerAnalysis = asAnalysis(answer.analysis); return <button key={answer.id} onClick={() => { setSelectedId(answer.id); setLocalAnalysis(null); }} data-testid={`button-answer-${answer.id}`} className={cn('w-full rounded-xl p-3 text-left transition-colors', selected?.id === answer.id ? 'bg-secondary' : 'hover:bg-secondary/60')}><div className="flex items-center justify-between gap-2"><span className="mono text-[10px] text-primary">0{index + 1}</span><span className={cn('text-sm font-extrabold', scoreTone(answerAnalysis?.scores?.overall))}>{answerAnalysis?.scores?.overall ? Math.round(answerAnalysis.scores.overall) : '—'}</span></div><p className="mt-2 line-clamp-2 text-xs leading-5 text-muted-foreground">{answer.question}</p><p className="mt-2 text-[10px] text-muted-foreground">{formatTime(answer.durationSeconds)}</p></button>; })}</div> : <div className="px-2 py-8 text-center text-xs leading-5 text-muted-foreground">No answers yet. Record your first one above.</div>}<button type="button" onClick={() => window.scrollTo({ top: 0, behavior: 'smooth' })} data-testid="button-detail-new-answer" className="w-full mt-4 flex items-center justify-center gap-2 rounded-xl border border-dashed border-primary/40 px-3 py-3 text-xs font-bold text-primary hover:bg-secondary"><Plus size={14} /> Practice another</button></aside><section id="analysis-result" className="min-w-0">{selected ? <div className="space-y-5"><div className="rounded-[22px] border border-border bg-card p-6 shadow-sm sm:p-7"><p className="mono text-[10px] uppercase tracking-[0.17em] text-primary">The answer</p><h2 className="serif mt-3 text-2xl leading-tight">{selected.question}</h2><div className="mt-5 flex flex-wrap gap-2"><span className="rounded-full bg-secondary px-3 py-1.5 text-[11px] font-bold">{formatTime(selected.durationSeconds)} spoken</span><span className="rounded-full bg-secondary px-3 py-1.5 text-[11px] font-bold">{selected.pauseCount} pauses</span><span className="rounded-full bg-secondary px-3 py-1.5 text-[11px] font-bold">{selected.fillerWordCount} filler words</span></div><p className="mt-6 whitespace-pre-wrap text-sm leading-7 text-muted-foreground">{selected.transcript}</p></div>{analysis ? <AnalysisPanel analysis={analysis} /> : <div className="rounded-[22px] border border-dashed border-border bg-card/60 p-10 text-center"><span className="mx-auto grid h-12 w-12 place-items-center rounded-2xl bg-secondary text-primary"><Sparkles size={20} /></span><h3 className="serif mt-4 text-xl">Analysis is waiting.</h3><p className="mx-auto mt-2 max-w-sm text-sm leading-6 text-muted-foreground">This answer has not been read by a provider yet. Return to the desk to send it for analysis.</p><Link href="/" data-testid="link-detail-analyze" className="mt-5 inline-flex rounded-xl bg-primary px-4 py-2.5 text-xs font-bold text-primary-foreground">Go to practice desk</Link></div>}</div> : <div className="rounded-[22px] border border-dashed border-border bg-card/60 p-10 text-center text-sm leading-6 text-muted-foreground">Record or upload your first answer above. Your analysis will appear here.</div>}</section></div></div>;
-}
-
-function ProviderCard({ provider }: { provider: Provider }) {
-  const available = provider.status === 'available' || provider.status === 'configured';
-  return <div className="rounded-2xl border border-border bg-card p-5 shadow-sm"><div className="flex items-start justify-between gap-4"><div><div className="flex items-center gap-2"><span className={cn('h-2 w-2 rounded-full', provider.status === 'configured' ? 'bg-[#4c9a89]' : available ? 'bg-[#d49a40]' : 'bg-muted-foreground/40')} /><h3 className="text-sm font-extrabold">{provider.label}</h3></div><p className="mono mt-2 text-[11px] text-muted-foreground">{provider.model}</p></div><span className={cn('rounded-full px-2 py-1 text-[10px] font-bold', provider.status === 'configured' ? 'bg-[#e2f0e8] text-[#267467]' : available ? 'bg-[#fff0d2] text-[#9b6819]' : 'bg-secondary text-muted-foreground')}>{provider.status}</span></div><p className="mt-4 text-xs leading-5 text-muted-foreground">{provider.detail || 'Provider availability is checked by the server.'}</p></div>;
-}
-
-function Settings() {
-  const { data: providerStatus, isLoading, isError, refetch } = useGetProviderStatus({ query: { queryKey: getGetProviderStatusQueryKey() } });
-  const [preference, setPreference] = useState(() => localStorage.getItem('interview-coach-provider') || 'ollama');
-  const savePreference = (value: string) => { setPreference(value); localStorage.setItem('interview-coach-provider', value); };
-  return <div className="mx-auto max-w-4xl px-5 py-8 sm:px-8 sm:py-12 lg:px-12"><PageHeader eyebrow="The quiet controls" title="Providers & settings" /><div className="space-y-5"><div className="rounded-[24px] border border-[#d9e8e0] bg-[#eef6f0] p-6 sm:p-7"><div className="flex items-start gap-4"><span className="grid h-11 w-11 shrink-0 place-items-center rounded-xl bg-[#d7eadd] text-[#267467]"><ShieldCheck size={20} /></span><div><h2 className="text-base font-extrabold text-[#225b52]">Local first. No key required.</h2><p className="mt-2 max-w-2xl text-sm leading-6 text-[#47756c]">Ollama is the preferred path for private practice: models run on your machine, your transcript stays close, and there is no provider key to manage. LM Studio is another local option. Hugging Face and Groq are available when you prefer hosted speed.</p><p className="mt-3 max-w-2xl text-xs leading-5 text-[#47756c]">If you are using this secure preview, the browser cannot call plain HTTP Ollama directly. Run the app locally or provide a reachable HTTPS model endpoint.</p></div></div></div><section className="rounded-[24px] border border-border bg-card p-6 shadow-sm sm:p-7"><div className="flex flex-col justify-between gap-4 sm:flex-row sm:items-end"><div><p className="mono text-[10px] uppercase tracking-[0.17em] text-primary">Active route</p><h2 className="serif mt-2 text-2xl">How Coach reads your answers</h2></div>{providerStatus && <span className="rounded-full bg-secondary px-3 py-1.5 text-[11px] font-bold">Server: {providerStatus.activeProvider} · {providerStatus.activeModel}</span>}</div><div className="mt-6"><label className="mb-2 block text-xs font-bold text-foreground/70">Preferred provider</label><select value={preference} onChange={(event) => savePreference(event.target.value)} data-testid="select-provider-preference" className="w-full rounded-xl border border-input bg-background px-3.5 py-3 text-sm outline-none focus:border-primary focus:ring-2 focus:ring-primary/15"><option value="ollama">Ollama · local and private</option><option value="lmstudio">LM Studio · local and private</option><option value="huggingface">Hugging Face · hosted</option><option value="groq">Groq · hosted</option></select><p className="mt-2 text-xs text-muted-foreground">This preference is saved on this device. The server’s active provider is shown above.</p></div></section><section><div className="mb-4 flex items-end justify-between"><div><p className="mono text-[10px] uppercase tracking-[0.17em] text-muted-foreground">Provider status</p><h2 className="serif mt-2 text-2xl">Available paths.</h2></div>{isError && <button onClick={() => refetch()} data-testid="button-retry-providers" className="inline-flex items-center gap-1 text-xs font-bold text-primary"><RotateCcw size={13} /> Retry</button>}</div>{isLoading ? <SkeletonRows /> : isError ? <div className="rounded-2xl border border-[#edc8c3] bg-[#fff2ef] p-5 text-sm text-[#954a42]">Provider status is unavailable right now.</div> : <div className="grid gap-3 sm:grid-cols-2">{providerStatus?.providers?.map((provider) => <ProviderCard key={provider.id} provider={provider} />)}</div>}</section><div className="flex items-start gap-3 rounded-2xl border border-border bg-secondary/45 p-5 text-xs leading-5 text-muted-foreground"><Info size={16} className="mt-0.5 shrink-0 text-primary" /><p>Coach looks at the answer itself and delivery signals like pauses and filler words. It is practice feedback, not a hiring decision.</p></div></div></div>;
+  return <div className="mx-auto max-w-[1240px] px-5 py-8 sm:px-8 sm:py-12 lg:px-12"><Link href="/" data-testid="link-back-dashboard" className="mb-8 inline-flex items-center gap-2 text-xs font-bold text-muted-foreground hover:text-foreground"><ArrowLeft size={15} /> Back to dashboard</Link><PageHeader eyebrow={`${interview.role}${interview.company ? ` · ${interview.company}` : ''}`} title={interview.title}><span className="rounded-full bg-[#e2f0e8] px-3 py-1.5 text-xs font-bold text-[#267467]">{interview.answerCount || interview.answers.length} answers logged</span><DeleteInterviewButton interviewId={interview.id} onDeleted={() => setLocation('/history')} /></PageHeader><div className="mb-8 space-y-8"><SessionRunner interviewId={interview.id} resumeContext={interview.resumeContext} topic={interview.topic} onActiveChange={setSessionActive} onFinished={() => { queryClient.invalidateQueries({ queryKey: getGetInterviewQueryKey(interview.id) }); queryClient.invalidateQueries({ queryKey: getListInterviewsQueryKey() }); queryClient.invalidateQueries({ queryKey: ['coach-progress'] }); }} />{!sessionActive && <PracticeWorkspace interview={interview} />}</div><div className="grid gap-5 xl:grid-cols-[290px_minmax(0,1fr)]"><aside className="h-fit rounded-[22px] border border-border bg-card p-4 shadow-sm"><div className="mb-4 flex items-center justify-between px-2"><p className="mono text-[10px] uppercase tracking-[0.16em] text-muted-foreground">Answer history</p><span className="text-xs text-muted-foreground">{interview.answers.length}</span></div>{interview.answers.length ? <div className="space-y-1">{interview.answers.map((answer, index) => { const answerAnalysis = asAnalysis(answer.analysis); return <button key={answer.id} onClick={() => { setSelectedId(answer.id); setLocalAnalysis(null); }} data-testid={`button-answer-${answer.id}`} className={cn('w-full rounded-xl p-3 text-left transition-colors', selected?.id === answer.id ? 'bg-secondary' : 'hover:bg-secondary/60')}><div className="flex items-center justify-between gap-2"><span className="mono text-[10px] text-primary">0{index + 1}</span><span className={cn('text-sm font-extrabold', scoreTone(answerAnalysis?.scores?.overall))}>{answerAnalysis?.scores?.overall ? Math.round(answerAnalysis.scores.overall) : '—'}</span></div><p className="mt-2 line-clamp-2 text-xs leading-5 text-muted-foreground">{answer.question}</p><p className="mt-2 text-[10px] text-muted-foreground">{formatTime(answer.durationSeconds)}</p></button>; })}</div> : <div className="px-2 py-8 text-center text-xs leading-5 text-muted-foreground">No answers yet. Record your first one above.</div>}<button type="button" onClick={() => window.scrollTo({ top: 0, behavior: 'smooth' })} data-testid="button-detail-new-answer" className="w-full mt-4 flex items-center justify-center gap-2 rounded-xl border border-dashed border-primary/40 px-3 py-3 text-xs font-bold text-primary hover:bg-secondary"><Plus size={14} /> Practice another</button></aside><section id="analysis-result" className="min-w-0">{selected ? <div className="space-y-5"><div className="rounded-[22px] border border-border bg-card p-6 shadow-sm sm:p-7"><p className="mono text-[10px] uppercase tracking-[0.17em] text-primary">The answer</p><h2 className="serif mt-3 text-2xl leading-tight">{selected.question}</h2><div className="mt-5 flex flex-wrap gap-2"><span className="rounded-full bg-secondary px-3 py-1.5 text-[11px] font-bold">{formatTime(selected.durationSeconds)} spoken</span><span className="rounded-full bg-secondary px-3 py-1.5 text-[11px] font-bold">{selected.pauseCount} pauses</span><span className="rounded-full bg-secondary px-3 py-1.5 text-[11px] font-bold">{selected.fillerWordCount} filler words</span></div><p className="mt-6 whitespace-pre-wrap text-sm leading-7 text-muted-foreground">{selected.transcript}</p></div>{analysis ? <AnalysisPanel analysis={analysis} /> : <div className="rounded-[22px] border border-dashed border-border bg-card/60 p-10 text-center"><span className="mx-auto grid h-12 w-12 place-items-center rounded-2xl bg-secondary text-primary"><Sparkles size={20} /></span><h3 className="serif mt-4 text-xl">Analysis is waiting.</h3><p className="mx-auto mt-2 max-w-sm text-sm leading-6 text-muted-foreground">This answer has not been reviewed yet. Open the dashboard and start a new session to get feedback.</p><Link href="/" data-testid="link-detail-analyze" className="mt-5 inline-flex rounded-xl bg-primary px-4 py-2.5 text-xs font-bold text-primary-foreground">Go to dashboard</Link></div>}</div> : <div className="rounded-[22px] border border-dashed border-border bg-card/60 p-10 text-center text-sm leading-6 text-muted-foreground">Record or upload your first answer above. Your analysis will appear here.</div>}</section></div></div>;
 }
 
 function RoutedErrorBoundary({ children }: { children: ReactNode }) {
@@ -533,12 +610,27 @@ function RoutedErrorBoundary({ children }: { children: ReactNode }) {
   return <ErrorBoundary resetKey={location}>{children}</ErrorBoundary>;
 }
 
-function Router() {
-  return <RoutedErrorBoundary><Shell><Switch><Route path="/" component={Dashboard} /><Route path="/interviews/:id" component={InterviewDetail} /><Route path="/settings" component={Settings} /><Route component={NotFound} /></Switch></Shell></RoutedErrorBoundary>;
+function Router({ user, onLogout }: { user: { name: string; email: string }; onLogout: () => void }) {
+  return <RoutedErrorBoundary><Shell user={user} onLogout={onLogout}><Switch><Route path="/">{() => <Home name={user.name} />}</Route><Route path="/interviews/:id" component={InterviewDetail} /><Route path="/history" component={HistoryPage} /><Route path="/progress" component={ProgressPage} /><Route component={NotFound} /></Switch></Shell></RoutedErrorBoundary>;
 }
 
 function App() {
-  return <QueryClientProvider client={queryClient}><TooltipProvider><WouterRouter base={import.meta.env.BASE_URL.replace(/\/$/, '')}><Router /></WouterRouter><Toaster /></TooltipProvider></QueryClientProvider>;
+  const [user, setUser] = useState<{ name: string; email: string } | null>(() => getStoredUser());
+
+  useEffect(() => {
+    const out = () => { queryClient.clear(); setUser(null); };
+    window.addEventListener(UNAUTHORIZED_EVENT, out);
+    void checkSession(); // drops the sign-in if the saved token is stale
+    return () => window.removeEventListener(UNAUTHORIZED_EVENT, out);
+  }, []);
+
+  const logout = () => { clearSession(); queryClient.clear(); setUser(null); };
+
+  if (!user) {
+    return <LoginPage onLogin={(u) => { queryClient.clear(); setUser(u); }} />;
+  }
+
+  return <QueryClientProvider client={queryClient}><TooltipProvider><WouterRouter base={import.meta.env.BASE_URL.replace(/\/$/, '')}><Router user={user} onLogout={logout} /></WouterRouter><Toaster /></TooltipProvider></QueryClientProvider>;
 }
 
 export default App;

@@ -1,4 +1,4 @@
-import express, { Router, type IRouter, type Request } from "express";
+import express, { Router, type IRouter, type Request, type Response as ExpressResponse } from "express";
 import {
   AnalyzeInterviewAnswerBody,
   AnalyzeInterviewAnswerParams,
@@ -12,12 +12,20 @@ import {
 } from "@workspace/api-zod";
 import { isRepeatQuestion, pickBankQuestion } from "../lib/question-bank";
 import { logger } from "../lib/logger";
-import fs from "node:fs";
-import path from "node:path";
+import { userIdOf } from "../lib/auth";
+import { buildSessionStats, countWords, LONG_ANSWER_SECONDS, SHORT_ANSWER_SECONDS, type SessionStats } from "../lib/session-stats";
+import {
+  deleteInterviewFor,
+  insertInterview,
+  listInterviewsFor,
+  loadAllInterviewsFor,
+  loadInterview,
+  saveInterview,
+} from "../lib/store";
 
 type ProviderId = "ollama" | "lmstudio" | "huggingface" | "groq";
 
-type Score = {
+export type Score = {
   overall: number;
   content: number;
   structure: number;
@@ -25,7 +33,7 @@ type Score = {
   delivery: number;
 };
 
-type Analysis = {
+export type Analysis = {
   provider: string;
   model: string;
   scores: Score;
@@ -39,7 +47,7 @@ type Analysis = {
   fillerWordCount: number;
 };
 
-type StoredAnswer = {
+export type StoredAnswer = {
   id: string;
   question: string;
   transcript: string;
@@ -47,9 +55,35 @@ type StoredAnswer = {
   pauseCount: number;
   fillerWordCount: number;
   analysis: Analysis | null;
+  createdAt: string;
+  sessionId: string | null;
+  delivery: Delivery | null;
 };
 
-type StoredInterview = {
+export type SessionReview = {
+  summary: string;
+  timeManagement: string;
+  strengths: string[];
+  improvements: string[];
+  nextSteps: string[];
+  bestAnswerIndex: number | null;
+  weakestAnswerIndex: number | null;
+};
+
+export type StoredSession = {
+  id: string;
+  startedAt: string;
+  endedAt: string;
+  plannedQuestions: number;
+  answeredCount: number;
+  endedEarly: boolean;
+  stats: SessionStats;
+  review: SessionReview | null;
+  reviewNote?: string;
+};
+
+export type StoredInterview = {
+  ownerId?: string; // id of the account that owns this room (set when it is created)
   id: string;
   title: string;
   role: string;
@@ -60,7 +94,10 @@ type StoredInterview = {
   updatedAt: string;
   resumeContext: string;
   topic: string;
+  level: string;
+  jobDescription: string;
   answers: StoredAnswer[];
+  sessions: StoredSession[];
   askedQuestions: string[];
   currentQuestion: { text: string; source: "ai" | "bank" } | null;
 };
@@ -75,59 +112,21 @@ type ProviderInfo = {
 
 const router: IRouter = Router();
 const preferredModels = ["qwen3:8b", "llama3.1:8b", "mistral:7b"];
-const interviews = new Map<string, StoredInterview>();
+/** An interview is only visible to the account that created it; anyone else gets "not found". */
+const ownedInterview = (res: ExpressResponse, id: string): Promise<StoredInterview | undefined> => loadInterview(userIdOf(res), id);
 
-// History is kept in memory AND saved to a JSON file, so it survives restarts.
-// Default location: <api-server folder>/data/interviews.json (override with INTERVIEWS_FILE in .env).
-const DATA_FILE = process.env.INTERVIEWS_FILE
-  ? path.resolve(process.env.INTERVIEWS_FILE)
-  : path.resolve(process.cwd(), "data", "interviews.json");
+// Interview level and job description are read straight from the raw request body
+// (the generated API schema would strip them), then cleaned here.
+const LEVELS = ["Intern / Fresher", "Junior (1-3 years)", "Mid-level (3-6 years)", "Senior (6+ years)"] as const;
+const DEFAULT_LEVEL = LEVELS[0];
+const MAX_TEXT_CHARS = 6000;
 
-function saveInterviews() {
-  try {
-    fs.mkdirSync(path.dirname(DATA_FILE), { recursive: true });
-    const tmp = `${DATA_FILE}.tmp`;
-    fs.writeFileSync(tmp, JSON.stringify(Array.from(interviews.values()), null, 2), "utf-8");
-    fs.renameSync(tmp, DATA_FILE); // write-then-rename so a crash never leaves a half-written file
-  } catch (error) {
-    logger.error({ err: error }, "Could not save interviews to disk");
-  }
-}
+const cleanLevel = (value: unknown): string =>
+  typeof value === "string" && (LEVELS as readonly string[]).includes(value) ? value : DEFAULT_LEVEL;
 
-function loadInterviews() {
-  if (!fs.existsSync(DATA_FILE)) return;
-  try {
-    const parsed = JSON.parse(fs.readFileSync(DATA_FILE, "utf-8")) as unknown;
-    if (!Array.isArray(parsed)) throw new Error("Saved interviews file is not a list");
-    for (const item of parsed as Partial<StoredInterview>[]) {
-      if (!item || typeof item.id !== "string") continue;
-      const answers = Array.isArray(item.answers) ? item.answers : [];
-      interviews.set(item.id, {
-        id: item.id,
-        title: item.title ?? "Untitled interview",
-        role: item.role ?? "",
-        company: item.company ?? null,
-        status: item.status === "completed" ? "completed" : "active",
-        answerCount: answers.length,
-        score: item.score ?? null,
-        updatedAt: item.updatedAt ?? new Date().toISOString(),
-        resumeContext: item.resumeContext ?? "",
-        topic: item.topic ?? "General interview",
-        answers,
-        askedQuestions: Array.isArray(item.askedQuestions) ? item.askedQuestions : [],
-        currentQuestion: item.currentQuestion ?? null,
-      });
-    }
-    logger.info({ count: interviews.size, file: DATA_FILE }, "Loaded saved interviews");
-  } catch (error) {
-    // Keep the unreadable file instead of overwriting it, then start fresh.
-    const backup = `${DATA_FILE}.corrupt-${Date.now()}`;
-    try { fs.renameSync(DATA_FILE, backup); } catch { /* ignore */ }
-    logger.error({ err: error, backup }, "Saved interviews could not be read; started with an empty history");
-  }
-}
+const cleanText = (value: unknown, max = MAX_TEXT_CHARS): string =>
+  typeof value === "string" ? value.trim().slice(0, max) : "";
 
-loadInterviews();
 
 const now = () => new Date().toISOString();
 
@@ -296,7 +295,7 @@ async function getProviders() {
   return [ollama, lmstudio, huggingface, groq];
 }
 
-type Delivery = {
+export type Delivery = {
   measured: boolean;
   pauseCount: number;
   totalPauseSeconds: number;
@@ -316,6 +315,8 @@ type AnalysisInput = {
   fillerWordCount: number;
   resumeContext?: string;
   topic?: string;
+  level?: string;
+  jobDescription?: string;
   delivery?: Delivery | null;
   askedQuestions?: string[];
 };
@@ -393,9 +394,12 @@ Rules:
 6. "riskFlags": only real concerns visible in the transcript or the measured data. Use an empty list if there are none.
 7. Do not diagnose personality or protected traits.
 8. Scores are integers from 0 to 100. "delivery" reflects the measured data when it is provided.
+9. Judge the answer against the interview level below. If a job description is given, say which of its requirements the answer supported or missed. Never credit the candidate with skills that are not in the transcript or the resume.
 
 Question: ${input.question}
 Topic: ${input.topic ?? "General interview"}
+Interview level: ${input.level ?? DEFAULT_LEVEL}
+Job description: ${input.jobDescription?.trim() ? input.jobDescription : "Not provided"}
 Transcript: ${input.transcript}
 Total recording length (seconds): ${input.durationSeconds}
 ${deliveryBlock}
@@ -432,7 +436,38 @@ function parseAnalysis(content: string, provider: ProviderInfo, input: {
 }
 
 // One place that talks to whichever provider is active and returns the raw text.
+const RATE_LIMITED = /rate.?limit|too many requests|\b429\b|tokens per (minute|day)|requests per (minute|day)|try again in/i;
+
+/** Providers say things like "Please try again in 6.2s" or "in 1m6.4s". Returns milliseconds, or null. */
+function retryHintMs(message: string): number | null {
+  const at = message.search(/try again in/i);
+  if (at < 0) return null;
+  const tail = message.slice(at);
+  const minutes = /(\d+(?:\.\d+)?)\s*m(?!s)/i.exec(tail);
+  const seconds = /(\d+(?:\.\d+)?)\s*s(?![a-z])/i.exec(tail);
+  const millis = /(\d+(?:\.\d+)?)\s*ms/i.exec(tail);
+  const total = (minutes ? parseFloat(minutes[1]) * 60_000 : 0) + (seconds ? parseFloat(seconds[1]) * 1000 : 0) + (millis ? parseFloat(millis[1]) : 0);
+  return total > 0 ? total : null;
+}
+
+/** Calls the AI provider. Free plans have per-minute limits, so a rate limit is waited out (up to 4 tries). */
 async function callProvider(provider: ProviderInfo, prompt: string, temperature = 0.2): Promise<string> {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await callProviderOnce(provider, prompt, temperature);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "";
+      if (attempt >= 4 || !RATE_LIMITED.test(message)) throw error;
+      const hint = retryHintMs(message);
+      if (hint != null && hint > 60_000) throw error; // e.g. a daily limit: waiting a minute will not help
+      const wait = Math.min(30_000, Math.max(3_000, (hint ?? 10_000) + 1_000));
+      logger.warn({ attempt, waitMs: wait }, "AI provider is rate limited, waiting before trying again");
+      await new Promise((resolve) => setTimeout(resolve, wait));
+    }
+  }
+}
+
+async function callProviderOnce(provider: ProviderInfo, prompt: string, temperature: number): Promise<string> {
   let response: Response;
   if (provider.id === "ollama") {
     response = await fetch(`${getOllamaBaseUrl()}/api/chat`, {
@@ -485,7 +520,7 @@ async function callProvider(provider: ProviderInfo, prompt: string, temperature 
     error?: { message?: string };
   };
   if (!response.ok) {
-    throw new Error(payload.error?.message ?? "The selected provider rejected the request.");
+    throw new Error(payload.error?.message ?? `The selected provider rejected the request (HTTP ${response.status}).`);
   }
   const content = payload.message?.content ?? payload.choices?.[0]?.message?.content;
   if (!content) throw new Error("The selected provider returned no analysis.");
@@ -504,19 +539,35 @@ async function generateAnalysis(provider: ProviderInfo, input: AnalysisInput) {
 
 async function generateQuestion(provider: ProviderInfo, interview: StoredInterview, asked: string[]) {
   const lastAnswer = interview.answers[interview.answers.length - 1];
+  const resume = interview.resumeContext.trim();
+  const jd = interview.jobDescription.trim();
+  // Alternate: every other question is personal to the resume / job description.
+  const personal = Boolean(resume || jd) && asked.length % 2 === 0;
+  const focus = personal
+    ? "THIS question must be about something specific: a project, skill or experience that is actually written on the resume, or a skill the job description asks for."
+    : "THIS question should be on the focus topic and suited to the level." +
+      (/core cs/i.test(interview.topic) && /mixed/i.test(interview.topic)
+        ? " The focus is mixed core CS: choose whichever of DBMS, operating systems, computer networks or OOP has been asked the least so far."
+        : "");
   const prompt = `You are a human interviewer running a mock interview. Write ONE new interview question.
 
 Role: ${interview.role}
 Company: ${interview.company ?? "not specified"}
 Focus topic: ${interview.topic}
-Candidate background (from their resume or notes): ${interview.resumeContext.trim() || "not provided; assume an entry-level candidate such as a student"}
+Interview level: ${interview.level} (match difficulty and expectations to this level; for Intern / Fresher use fundamentals, projects and learning ability rather than system design)
+
+Job description:
+${jd || "not provided"}
+
+Candidate resume or background:
+${resume || "not provided; assume an entry-level candidate such as a student"}
 
 Questions already asked (do NOT repeat or rephrase any of them):
 ${asked.length ? asked.map((q) => `- ${q}`).join("\n") : "- none yet"}
-${lastAnswer ? `\nThe candidate's previous answer, for context (ask a natural follow-up only if it clearly opens one; otherwise move to a different area of the topic):\n${lastAnswer.transcript.slice(0, 500)}\n` : ""}
+${lastAnswer ? `\nThe candidate's previous answer, for context (ask a natural follow-up only if it clearly opens one; otherwise move to a different area):\n${lastAnswer.transcript.slice(0, 500)}\n` : ""}
 Rules:
-- The question must fit the role and the focus topic, and be realistic for the candidate's level.
-- Do not assume the candidate has experience that is not in their background.
+- ${focus}
+- Never assume experience, projects or skills that are not on the resume.
 - Keep it under 40 words and ask only one thing.
 - Return ONLY JSON: {"question": "..."}`;
   const content = await callProvider(provider, prompt, 0.8);
@@ -534,17 +585,16 @@ async function activeProvider() {
   return providers.find((provider) => provider.status === "available") ?? providers[0];
 }
 
-router.get("/interviews", (_req, res) => {
-  const data = Array.from(interviews.values())
-    .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
-    .map(interviewSummary);
+router.get("/interviews", async (_req, res) => {
+  const data = (await listInterviewsFor(userIdOf(res))).map(interviewSummary);
   res.json(ListInterviewsResponse.parse(data));
 });
 
-router.post("/interviews", (req, res) => {
+router.post("/interviews", async (req, res) => {
   const input = CreateInterviewBody.parse(req.body);
   const interview: StoredInterview = {
     id: crypto.randomUUID(),
+    ownerId: userIdOf(res),
     title: input.title,
     role: input.role,
     company: input.company || null,
@@ -552,20 +602,22 @@ router.post("/interviews", (req, res) => {
     answerCount: 0,
     score: null,
     updatedAt: now(),
-    resumeContext: input.resumeContext ?? "",
+    resumeContext: cleanText(input.resumeContext),
     topic: input.topic ?? "General interview",
+    level: cleanLevel((req.body as { level?: unknown } | undefined)?.level),
+    jobDescription: cleanText((req.body as { jobDescription?: unknown } | undefined)?.jobDescription),
     answers: [],
+    sessions: [],
     askedQuestions: [],
     currentQuestion: null,
   };
-  interviews.set(interview.id, interview);
-  saveInterviews();
+  await insertInterview(interview, userIdOf(res));
   res.status(201).json(CreateInterviewResponse.parse(interview));
 });
 
-router.get("/interviews/:id", (req, res) => {
+router.get("/interviews/:id", async (req, res) => {
   const params = GetInterviewParams.parse(req.params);
-  const interview = interviews.get(params.id);
+  const interview = await ownedInterview(res, params.id);
   if (!interview) {
     res.status(404).json({ error: "Interview not found" });
     return;
@@ -574,7 +626,7 @@ router.get("/interviews/:id", (req, res) => {
 });
 
 router.post("/interviews/:id/next-question", async (req: Request, res) => {
-  const interview = interviews.get(String(req.params.id));
+  const interview = await ownedInterview(res, String(req.params.id));
   if (!interview) {
     res.status(404).json({ error: "Interview not found" });
     return;
@@ -592,10 +644,10 @@ router.post("/interviews/:id/next-question", async (req: Request, res) => {
   }
 
   const asked = [...interview.askedQuestions, ...answered];
-  const remember = (text: string, source: "ai" | "bank") => {
+  const remember = async (text: string, source: "ai" | "bank") => {
     interview.currentQuestion = { text, source };
     interview.askedQuestions.push(text);
-    saveInterviews();
+    await saveInterview(interview);
   };
 
   let note = "";
@@ -606,7 +658,7 @@ router.post("/interviews/:id/next-question", async (req: Request, res) => {
       for (let attempt = 0; attempt < 2; attempt++) {
         const question = await generateQuestion(provider, interview, asked);
         if (question && !isRepeatQuestion(question, asked)) {
-          remember(question, "ai");
+          await remember(question, "ai");
           res.json({ question, source: "ai" });
           return;
         }
@@ -619,7 +671,7 @@ router.post("/interviews/:id/next-question", async (req: Request, res) => {
   }
 
   const picked = pickBankQuestion(interview, asked);
-  remember(picked.question, "bank");
+  await remember(picked.question, "bank");
   if (!note && picked.usedGeneralPool) note = "You have used every bank question for this topic, so this is a general interview question.";
   if (!note && picked.startedOver) note = "You have seen every bank question, so questions may repeat from now on.";
   res.json({ question: picked.question, source: "bank", note: note || undefined });
@@ -628,12 +680,15 @@ router.post("/interviews/:id/next-question", async (req: Request, res) => {
 router.post("/interviews/:id/analyze", async (req: Request, res) => {
   const params = AnalyzeInterviewAnswerParams.parse(req.params);
   const input = AnalyzeInterviewAnswerBody.parse(req.body);
-  const interview = interviews.get(params.id);
+  const interview = await ownedInterview(res, params.id);
   if (!interview) {
     res.status(404).json({ error: "Interview not found" });
     return;
   }
   try {
+    const rawBody = req.body as { delivery?: unknown; sessionId?: unknown } | undefined;
+    const delivery = readDelivery(rawBody?.delivery);
+    const sessionId = cleanSessionId(rawBody?.sessionId);
     const provider = await activeProvider();
     let analysis: Analysis;
     if (input.clientAnalysis) {
@@ -647,7 +702,9 @@ router.post("/interviews/:id/analyze", async (req: Request, res) => {
     } else {
       analysis = await generateAnalysis(provider, {
         ...input,
-        delivery: readDelivery((req.body as { delivery?: unknown } | undefined)?.delivery),
+        level: interview.level,
+        jobDescription: interview.jobDescription,
+        delivery,
         askedQuestions: [...interview.askedQuestions, ...interview.answers.map((a) => a.question)],
       });
     }
@@ -659,6 +716,9 @@ router.post("/interviews/:id/analyze", async (req: Request, res) => {
       pauseCount: input.pauseCount,
       fillerWordCount: input.fillerWordCount,
       analysis,
+      createdAt: now(),
+      sessionId,
+      delivery,
     };
     interview.answers.push(answer);
     interview.currentQuestion = null;
@@ -672,7 +732,7 @@ router.post("/interviews/:id/analyze", async (req: Request, res) => {
     );
     interview.updatedAt = now();
     interview.status = "completed";
-    saveInterviews();
+    await saveInterview(interview);
     res.json(AnalyzeInterviewAnswerResponse.parse(analysis));
   } catch (error) {
     req.log.error({ err: error }, "Interview answer analysis failed");
@@ -683,6 +743,252 @@ router.post("/interviews/:id/analyze", async (req: Request, res) => {
           : "The AI provider could not analyze this answer.",
     });
   }
+});
+
+// ---------- Practice sessions, progress and deleting ----------
+
+const cleanSessionId = (value: unknown): string | null =>
+  typeof value === "string" && /^[A-Za-z0-9_-]{8,64}$/.test(value) ? value : null;
+
+const strText = (value: unknown, max = 900) => (typeof value === "string" ? value.trim().slice(0, max) : "");
+const strList = (value: unknown, maxItems = 5, maxLen = 300): string[] =>
+  Array.isArray(value)
+    ? value.filter((v): v is string => typeof v === "string").map((v) => v.trim().slice(0, maxLen)).filter(Boolean).slice(0, maxItems)
+    : [];
+const indexOrNull = (value: unknown, count: number) =>
+  typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= count ? value : null;
+
+function sanitizeReview(raw: unknown, answerCount: number): SessionReview {
+  const r = (raw && typeof raw === "object" ? raw : {}) as Record<string, unknown>;
+  const review: SessionReview = {
+    summary: strText(r.summary),
+    timeManagement: strText(r.timeManagement),
+    strengths: strList(r.strengths, 4),
+    improvements: strList(r.improvements, 5),
+    nextSteps: strList(r.nextSteps, 4),
+    bestAnswerIndex: indexOrNull(r.bestAnswerIndex, answerCount),
+    weakestAnswerIndex: indexOrNull(r.weakestAnswerIndex, answerCount),
+  };
+  if (!review.summary) throw new Error("The AI returned an empty session review.");
+  return review;
+}
+
+
+const fmtSeconds = (seconds: number | null) => (seconds == null ? "--" : `${Math.floor(seconds / 60)}:${String(Math.round(seconds % 60)).padStart(2, "0")}`);
+
+/** Used when the AI review cannot be generated. Written only from numbers that were measured. */
+function fallbackReview(stats: SessionStats): SessionReview {
+  const per = stats.perAnswer;
+  const scored = per.filter((a) => a.overall != null);
+  const best = scored.length > 1 ? scored.reduce((hi, cur) => ((cur.overall ?? 0) > (hi.overall ?? 0) ? cur : hi)) : null;
+  const weakest = scored.length > 1 ? scored.reduce((lo, cur) => ((cur.overall ?? 0) < (lo.overall ?? 0) ? cur : lo)) : null;
+  const { short, good, long } = stats.timingCounts;
+
+  const timing: string[] = [];
+  if (stats.shortestSeconds != null && stats.longestSeconds != null) {
+    timing.push(`Your answers ranged from ${fmtSeconds(stats.shortestSeconds)} to ${fmtSeconds(stats.longestSeconds)}, averaging ${fmtSeconds(stats.avgSeconds)}.`);
+  }
+  if (short) timing.push(`${short} answer${short > 1 ? "s were" : " was"} under ${SHORT_ANSWER_SECONDS} seconds: add one concrete example and the result so each answer reaches about 45 to 90 seconds.`);
+  if (long) timing.push(`${long} answer${long > 1 ? "s ran" : " ran"} over ${LONG_ANSWER_SECONDS} seconds: lead with the point and cut the background.`);
+  if (!short && !long && stats.answered) timing.push("All answers were a comfortable length.");
+
+  const strengths: string[] = [];
+  if (good) strengths.push(`${good} of ${stats.answered} answers were a comfortable length.`);
+  if (stats.avgWpm != null && stats.avgWpm >= 110 && stats.avgWpm <= 160) strengths.push(`Your speaking pace (${stats.avgWpm} words per minute) is easy to follow.`);
+  if (stats.fillersPer100Words != null && stats.fillersPer100Words < 2) strengths.push(`Very few filler words (${stats.fillersPer100Words} per 100 words).`);
+  if (best) strengths.push(`Answer ${best.index} was your strongest, with a score of ${best.overall}.`);
+  if (!strengths.length) strengths.push("You completed the session and recorded your answers.");
+
+  const improvements: string[] = [];
+  if (short) improvements.push("Extend short answers with an example and a result.");
+  if (long) improvements.push("Tighten long answers: state the point first, then one example.");
+  if (stats.fillersPer100Words != null && stats.fillersPer100Words >= 3) improvements.push(`Reduce filler words (${stats.fillersPer100Words} per 100 words). A silent pause sounds more confident.`);
+  if (stats.avgWpm != null && stats.avgWpm > 160) improvements.push(`Slow down a little: ${stats.avgWpm} words per minute is fast.`);
+  if (stats.avgWpm != null && stats.avgWpm < 100) improvements.push(`Your pace (${stats.avgWpm} words per minute) is slow. Try to keep the answer flowing.`);
+  if (stats.longestPauseSeconds != null && stats.longestPauseSeconds >= 3) improvements.push(`Your longest pause was ${stats.longestPauseSeconds.toFixed(1)} seconds. Practise a short bridging phrase to recover.`);
+  if (stats.avgScores) {
+    const areas: Array<[string, number]> = [["content", stats.avgScores.content], ["structure", stats.avgScores.structure], ["confidence", stats.avgScores.confidence], ["delivery", stats.avgScores.delivery]];
+    const [name, value] = areas.reduce((lo, cur) => (cur[1] < lo[1] ? cur : lo));
+    improvements.push(`Your lowest area was ${name} (${value}). Work on that first.`);
+  }
+  if (!improvements.length) improvements.push("Nothing stood out in the numbers. Keep practising with harder questions.");
+
+  const nextSteps: string[] = [];
+  if (weakest) nextSteps.push(`Redo answer ${weakest.index} and aim for 60 to 90 seconds.`);
+  nextSteps.push(stats.avgScores ? `Record another session and try to beat your average score of ${stats.avgScores.overall}.` : "Record another session to compare your numbers.");
+
+  return {
+    summary: `You answered ${stats.answered} of ${stats.planned} questions in ${fmtSeconds(stats.totalSeconds)} of speaking time${stats.avgScores ? `, with an average score of ${stats.avgScores.overall} out of 100` : ""}.`,
+    timeManagement: timing.join(" "),
+    strengths,
+    improvements,
+    nextSteps,
+    bestAnswerIndex: best ? best.index : null,
+    weakestAnswerIndex: weakest && weakest !== best ? weakest.index : null,
+  };
+}
+
+async function generateSessionReview(
+  provider: ProviderInfo,
+  interview: StoredInterview,
+  stats: SessionStats,
+  answers: StoredAnswer[],
+): Promise<SessionReview> {
+  const mmss = (s: number) => `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+  const lines = stats.perAnswer.map((p, i) => {
+    const a = answers[i];
+    const pace = p.wpm !== null ? `${p.wpm} wpm, ${p.pauses} pauses (longest ${p.longestPauseSeconds?.toFixed(1)}s)` : "pace and pauses not measured";
+    return `Answer ${p.index}: "${p.question}"\n  length ${p.durationSeconds}s (${p.timing}); overall score ${p.overall ?? "n/a"}; ${pace}; fillers ${p.fillers}\n  coach summary: ${a.analysis?.summary ?? "n/a"}\n  top improvement: ${a.analysis?.improvements?.[0] ?? "n/a"}`;
+  });
+  const prompt = `You are a rigorous but encouraging mock-interview coach writing the end-of-session report for a candidate.
+Return ONLY valid JSON with this exact shape:
+{"summary":"","timeManagement":"","strengths":[],"improvements":[],"nextSteps":[],"bestAnswerIndex":1,"weakestAnswerIndex":2}
+
+Rules:
+1. Use ONLY the data below. Do not invent numbers, projects or experience.
+2. "timeManagement": 2-4 sentences analysing the answer lengths with the exact measured numbers (total time, average, shortest, longest, how many answers were short or long). Say what to change. The rule of thumb is: under ${30} seconds is too short, over ${150} seconds is too long.
+3. Do not comment on pace, pauses or fillers for answers marked "not measured".
+4. "strengths": 2-3 items. "improvements": 3 specific, practical items. "nextSteps": 2-3 concrete things to practise in the next session.
+5. "bestAnswerIndex" and "weakestAnswerIndex" are the 1-based answer numbers from the list, or null.
+
+Role: ${interview.role}; level: ${interview.level}; focus topic: ${interview.topic}
+Questions answered: ${stats.answered} of ${stats.planned}
+Total speaking time: ${mmss(stats.totalSeconds)}; average ${stats.avgSeconds ?? "n/a"}s; shortest ${stats.shortestSeconds ?? "n/a"}s; longest ${stats.longestSeconds ?? "n/a"}s
+Answer lengths: ${stats.timingCounts.short} short, ${stats.timingCounts.good} good, ${stats.timingCounts.long} long
+Average scores: ${stats.avgScores ? JSON.stringify(stats.avgScores) : "n/a"}
+Measured delivery (${stats.measuredAnswers} answers): average ${stats.avgWpm ?? "n/a"} wpm; total pauses ${stats.totalPauses ?? "n/a"}; longest pause ${stats.longestPauseSeconds ?? "n/a"}s
+Filler words: ${stats.totalFillers} total (${stats.fillersPer100Words ?? "n/a"} per 100 words)
+
+${lines.join("\n")}
+`;
+  const content = await callProvider(provider, prompt, 0.3);
+  return sanitizeReview(extractJson(content), stats.answered);
+}
+
+router.post("/interviews/:id/session-report", async (req: Request, res) => {
+  const interview = await ownedInterview(res, String(req.params.id));
+  if (!interview) {
+    res.status(404).json({ error: "Interview not found" });
+    return;
+  }
+  const body = (req.body ?? {}) as { sessionId?: unknown; plannedQuestions?: unknown };
+  const sessionId = cleanSessionId(body.sessionId);
+  if (!sessionId) {
+    res.status(400).json({ error: "A valid sessionId is required." });
+    return;
+  }
+  const existing = interview.sessions.find((s) => s.id === sessionId);
+  if (existing && existing.review && !existing.reviewNote) {
+    res.json({ session: existing });
+    return;
+  }
+  const answers = interview.answers.filter((a) => a.sessionId === sessionId);
+  if (!answers.length) {
+    res.status(400).json({ error: "No answered questions were found for this session." });
+    return;
+  }
+  const requested = typeof body.plannedQuestions === "number" && Number.isInteger(body.plannedQuestions) ? body.plannedQuestions : answers.length;
+  const planned = Math.min(20, Math.max(answers.length, requested));
+  const stats = buildSessionStats(
+    answers.map((a) => ({
+      question: a.question,
+      transcript: a.transcript,
+      durationSeconds: a.durationSeconds,
+      fillerWordCount: a.fillerWordCount,
+      scores: a.analysis?.scores ?? null,
+      delivery: a.delivery,
+    })),
+    planned,
+  );
+
+  let review: SessionReview | null = null;
+  let reviewNote: string | undefined;
+  try {
+    const provider = await activeProvider();
+    if (provider.status !== "available") throw new Error("No AI provider is available.");
+    review = await generateSessionReview(provider, interview, stats, answers);
+  } catch (error) {
+    req.log.warn({ err: error }, "Session review could not be generated");
+    review = fallbackReview(stats);
+    reviewNote = "The AI review was not available, so this summary was written automatically from your measured numbers. All scores and timings are real.";
+  }
+
+  const session: StoredSession = {
+    id: sessionId,
+    startedAt: answers[0].createdAt,
+    endedAt: now(),
+    plannedQuestions: planned,
+    answeredCount: answers.length,
+    endedEarly: answers.length < planned,
+    stats,
+    review,
+    reviewNote,
+  };
+  interview.sessions = interview.sessions.filter((s) => s.id !== sessionId);
+  interview.sessions.push(session);
+  await saveInterview(interview);
+  res.json({ session: { ...session, interviewId: interview.id, interviewTitle: interview.title } });
+});
+
+router.get("/interviews/:id/sessions", async (req, res) => {
+  const interview = await ownedInterview(res, String(req.params.id));
+  if (!interview) {
+    res.status(404).json({ error: "Interview not found" });
+    return;
+  }
+  res.json({ sessions: interview.sessions });
+});
+
+router.get("/progress", async (_req, res) => {
+  const me = userIdOf(res);
+  const round1 = (value: number) => Math.round(value * 10) / 10;
+  const answers: unknown[] = [];
+  const sessions: unknown[] = [];
+  for (const interview of await loadAllInterviewsFor(me)) {
+    for (const answer of interview.answers) {
+      const scores = answer.analysis?.scores;
+      const words = countWords(answer.transcript);
+      const measured = answer.delivery?.measured === true;
+      answers.push({
+        interviewId: interview.id,
+        interviewTitle: interview.title,
+        role: interview.role,
+        topic: interview.topic,
+        level: interview.level,
+        createdAt: answer.createdAt,
+        question: answer.question,
+        overall: scores?.overall ?? null,
+        content: scores?.content ?? null,
+        structure: scores?.structure ?? null,
+        confidence: scores?.confidence ?? null,
+        delivery: scores?.delivery ?? null,
+        durationSeconds: answer.durationSeconds,
+        words,
+        fillers: answer.fillerWordCount,
+        fillersPer100Words: words > 0 ? round1((answer.fillerWordCount / words) * 100) : null,
+        measured,
+        wpm: measured ? answer.delivery?.wordsPerMinute ?? null : null,
+        pauseCount: measured ? answer.delivery?.pauseCount ?? null : null,
+        longestPauseSeconds: measured ? answer.delivery?.longestPauseSeconds ?? null : null,
+        sessionId: answer.sessionId,
+      });
+    }
+    for (const session of interview.sessions) {
+      sessions.push({ ...session, interviewId: interview.id, interviewTitle: interview.title });
+    }
+  }
+  answers.sort((a, b) => String((a as { createdAt: string }).createdAt).localeCompare(String((b as { createdAt: string }).createdAt)));
+  sessions.sort((a, b) => String((a as { endedAt: string }).endedAt).localeCompare(String((b as { endedAt: string }).endedAt)));
+  res.json({ answers, sessions });
+});
+
+router.delete("/interviews/:id", async (req, res) => {
+  const id = String(req.params.id);
+  if (!(await deleteInterviewFor(userIdOf(res), id))) {
+    res.status(404).json({ error: "Interview not found" });
+    return;
+  }
+  res.json({ deleted: true, id });
 });
 
 router.get("/providers/status", async (_req, res) => {

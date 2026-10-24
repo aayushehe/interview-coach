@@ -57,3 +57,11 @@ artifacts/api-server/data/
 
 .env
 start.ps1
+
+# local junk
+project.share/
+project.share.zip
+*.bak
+.start-pids.txt
+backup.sql
+*.imported-*.bak
